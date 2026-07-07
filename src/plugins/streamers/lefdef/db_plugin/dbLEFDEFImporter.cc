@@ -31,6 +31,12 @@
 #include "tlStream.h"
 #include "tlProgress.h"
 #include "tlFileUtils.h"
+#include "tlEnv.h"         //  vibeic fork: env-var overrides for the streamout fixes
+#include "tlGlobPattern.h" //  vibeic fork: layer-map auto-discovery (*.map / *.layermap)
+//  NOTE (vibeic fork): merge-abutting streamout uses db::ShapeProcessor (already
+//  pulled in via dbShapeProcessor.h) rather than db::Region, because dbRegion.h
+//  injects an unscoped db::None that clashes with the LayerPurpose::None enum
+//  defined in this plugin's header.
 
 #include <cctype>
 
@@ -244,14 +250,20 @@ RuleBasedViaGenerator::create_cell (LEFDEFReaderState &reader, Layout &layout, d
 
   std::set <unsigned int> dl;
 
+  //  vibeic fork: snap generated via enclosure/cut geometry to the manufacturing
+  //  grid.  The centering (vs/2) truncation and the LEF enclosure/spacing
+  //  arithmetic can land these generated coordinates off the manufacturing grid
+  //  (on the DBU grid only), which is one of the documented OFFGRID false-DRC
+  //  sources.  snap_mfg is a no-op when snapping is disabled or the geometry is
+  //  already grid-legal.
   dl = reader.open_layer (layout, m_bottom_layer, ViaGeometry, mask_bottom);
   for (std::set<unsigned int>::const_iterator l = dl.begin (); l != dl.end (); ++l) {
-    cell.shapes (*l).insert (db::Polygon (via_box.enlarged (m_be).moved (m_bo)));
+    cell.shapes (*l).insert (db::Polygon (reader.snap_mfg (via_box.enlarged (m_be).moved (m_bo), layout)));
   }
 
   dl = reader.open_layer (layout, m_top_layer, ViaGeometry, mask_top);
   for (std::set<unsigned int>::const_iterator l = dl.begin (); l != dl.end (); ++l) {
-    cell.shapes (*l).insert (db::Polygon (via_box.enlarged (m_te).moved (m_to)));
+    cell.shapes (*l).insert (db::Polygon (reader.snap_mfg (via_box.enlarged (m_te).moved (m_to), layout)));
   }
 
   const char *p = m_pattern.c_str ();
@@ -350,7 +362,7 @@ RuleBasedViaGenerator::create_cell (LEFDEFReaderState &reader, Layout &layout, d
 
           dl = reader.open_layer (layout, m_cut_layer, ViaGeometry, cm, vb);
           for (std::set<unsigned int>::const_iterator l = dl.begin (); l != dl.end (); ++l) {
-            cell.shapes (*l).insert (db::Polygon (vb));
+            cell.shapes (*l).insert (db::Polygon (reader.snap_mfg (vb, layout)));  //  vibeic fork: manufacturing-grid snap
           }
 
         }
@@ -978,9 +990,211 @@ LEFDEFReaderOptions::reader_state (db::Layout &layout, const std::string &base_p
 //  LEFDEFLayerDelegate implementation
 
 LEFDEFReaderState::LEFDEFReaderState (const LEFDEFReaderOptions *tc)
-  : mp_importer (0), m_create_layers (true), m_has_explicit_layer_mapping (false), m_laynum (1), mp_tech_comp (tc)
+  : mp_importer (0), m_create_layers (true), m_has_explicit_layer_mapping (false), m_laynum (1),
+    m_manufacturing_grid (0.0),        //  vibeic fork
+    m_merge_requested (false),         //  vibeic fork
+    m_merge_top_cell (0),              //  vibeic fork
+    mp_tech_comp (tc)
 {
   //  .. nothing yet ..
+}
+
+// -----------------------------------------------------------------------------------
+//  vibeic fork: manufacturing-grid snap, merge-abutting streamout helpers
+//
+//  These mirror what commercial streamout does and remove the two largest
+//  false-DRC populations measured on real silicon with the OSS flow:
+//    * ~76% OFFGRID false-DRC from KLayout enforcing only the DBU grid on
+//      generated instance displacements + via/enclosure geometry, and
+//    * ~26% boundary false min-spacing/width DRC from abutting same-layer
+//      shapes across instance boundaries being written as separate polygons.
+//  Design-agnostic; the snap only moves coordinates that are already off the
+//  manufacturing grid (a no-op for grid-legal geometry, so it never distorts a
+//  correct shape) and the merge is opt-in.
+
+static db::Coord snap_coord (db::Coord c, db::Coord g)
+{
+  if (g <= 1) {
+    return c;
+  }
+  //  round to nearest multiple of g (symmetric about 0)
+  if (c >= 0) {
+    return ((c + g / 2) / g) * g;
+  } else {
+    return -((((-c) + g / 2) / g) * g);
+  }
+}
+
+db::Coord
+LEFDEFReaderState::mfg_grid_dbu (const db::Layout &layout) const
+{
+  double grid_um = m_manufacturing_grid;
+
+  //  allow forcing/overriding the grid (microns) when the LEF omits MANUFACTURINGGRID
+  std::string ov = tl::get_env ("KLAYOUT_LEFDEF_MFG_GRID");
+  if (! ov.empty ()) {
+    tl::Extractor ex (ov.c_str ());
+    double v = 0.0;
+    if (ex.try_read (v) && v > 0.0) {
+      grid_um = v;
+    }
+  }
+
+  if (grid_um <= 0.0 || layout.dbu () <= 0.0) {
+    return 0;
+  }
+  db::Coord g = db::coord_traits<db::Coord>::rounded (grid_um / layout.dbu ());
+  return g > 1 ? g : 0;
+}
+
+bool
+LEFDEFReaderState::mfg_snap_enabled () const
+{
+  //  default ON (this is the fork's whole point); KLAYOUT_LEFDEF_MFG_GRID_SNAP=0 restores stock behaviour
+  return tl::get_env ("KLAYOUT_LEFDEF_MFG_GRID_SNAP", "1") != "0";
+}
+
+db::Vector
+LEFDEFReaderState::snap_mfg (const db::Vector &v, const db::Layout &layout) const
+{
+  if (! mfg_snap_enabled ()) {
+    return v;
+  }
+  db::Coord g = mfg_grid_dbu (layout);
+  if (g == 0) {
+    return v;
+  }
+  return db::Vector (snap_coord (v.x (), g), snap_coord (v.y (), g));
+}
+
+db::Point
+LEFDEFReaderState::snap_mfg (const db::Point &p, const db::Layout &layout) const
+{
+  if (! mfg_snap_enabled ()) {
+    return p;
+  }
+  db::Coord g = mfg_grid_dbu (layout);
+  if (g == 0) {
+    return p;
+  }
+  return db::Point (snap_coord (p.x (), g), snap_coord (p.y (), g));
+}
+
+db::Box
+LEFDEFReaderState::snap_mfg (const db::Box &b, const db::Layout &layout) const
+{
+  if (! mfg_snap_enabled () || b.empty ()) {
+    return b;
+  }
+  db::Coord g = mfg_grid_dbu (layout);
+  if (g == 0) {
+    return b;
+  }
+  return db::Box (snap_coord (b.left (), g), snap_coord (b.bottom (), g),
+                  snap_coord (b.right (), g), snap_coord (b.top (), g));
+}
+
+db::Polygon
+LEFDEFReaderState::snap_mfg (const db::Polygon &p, const db::Layout &layout) const
+{
+  if (! mfg_snap_enabled ()) {
+    return p;
+  }
+  db::Coord g = mfg_grid_dbu (layout);
+  if (g == 0) {
+    return p;
+  }
+
+  std::vector<db::Point> hull;
+  hull.reserve (p.hull ().size ());
+  for (db::Polygon::polygon_contour_iterator e = p.begin_hull (); e != p.end_hull (); ++e) {
+    hull.push_back (db::Point (snap_coord ((*e).x (), g), snap_coord ((*e).y (), g)));
+  }
+
+  db::Polygon res;
+  res.assign_hull (hull.begin (), hull.end ());
+
+  for (unsigned int h = 0; h < p.holes (); ++h) {
+    std::vector<db::Point> hole;
+    for (db::Polygon::polygon_contour_iterator e = p.begin_hole (h); e != p.end_hole (h); ++e) {
+      hole.push_back (db::Point (snap_coord ((*e).x (), g), snap_coord ((*e).y (), g)));
+    }
+    res.insert_hole (hole.begin (), hole.end ());
+  }
+
+  return res;
+}
+
+bool
+LEFDEFReaderState::merge_abutting_enabled () const
+{
+  //  opt-in (roadmap: "behind a merge-abutting option")
+  return tl::get_env ("KLAYOUT_LEFDEF_MERGE_ABUTTING", "0") == "1";
+}
+
+void
+LEFDEFReaderState::finish_merge_abutting (db::Layout &layout, db::Cell &top) const
+{
+  if (! merge_abutting_enabled ()) {
+    return;
+  }
+
+  //  Resolve the geometry into the top cell so that shapes abutting across
+  //  instance boundaries become mergeable, then union them per layer.  This is
+  //  what Calibre/Innovus/ICC2 streamout does at write time.  Opt-in because a
+  //  full flatten can be heavy on CPU-class designs.
+  layout.flatten (top, -1, true /*prune*/);
+
+  for (db::Layout::layer_iterator li = layout.begin_layers (); li != layout.end_layers (); ++li) {
+
+    unsigned int l = (*li).first;
+    db::Shapes &shapes = top.shapes (l);
+
+    //  collect the polygon-convertible shapes (polygons / boxes / paths)
+    std::vector<db::Shape> in;
+    for (db::Shapes::shape_iterator s = shapes.begin (db::ShapeIterator::Regions); ! s.at_end (); ++s) {
+      in.push_back (*s);
+    }
+    if (in.empty ()) {
+      continue;
+    }
+
+    //  preserve non-polygon shapes (texts / labels) which the boolean merge would drop
+    std::vector<db::Text> texts;
+    for (db::Shapes::shape_iterator s = shapes.begin (db::ShapeIterator::Texts); ! s.at_end (); ++s) {
+      db::Text t;
+      s->text (t);
+      texts.push_back (t);
+    }
+
+    //  union abutting same-layer polygons (reads 'in' before we clear the container)
+    std::vector<db::Polygon> out;
+    db::ShapeProcessor sp;
+    sp.merge (in, out, 0 /*min_wc*/, true /*resolve_holes*/, true /*min_coherence*/);
+
+    shapes.clear ();
+    for (std::vector<db::Polygon>::const_iterator p = out.begin (); p != out.end (); ++p) {
+      shapes.insert (*p);
+    }
+    for (std::vector<db::Text>::const_iterator t = texts.begin (); t != texts.end (); ++t) {
+      shapes.insert (*t);
+    }
+
+  }
+
+  //  After fully flattening the design top, every other top-level cell is an
+  //  orphan whose geometry has already been copied into the top (or an unused
+  //  LEF macro master).  Drop them so the merged design has a single flat top,
+  //  which is what a streamout-with-merge is expected to produce.
+  std::set<db::cell_index_type> orphans;
+  for (db::Layout::const_iterator c = layout.begin (); c != layout.end (); ++c) {
+    if (c->cell_index () != top.cell_index () && c->is_top ()) {
+      orphans.insert (c->cell_index ());
+    }
+  }
+  if (! orphans.empty ()) {
+    layout.delete_cells (orphans);
+  }
 }
 
 LEFDEFReaderState::~LEFDEFReaderState ()
@@ -1013,6 +1227,55 @@ LEFDEFReaderState::init (Layout &layout, const std::string &base_path, const Loa
 
     m_layer_map = mp_tech_comp->layer_map ();
     m_create_layers = mp_tech_comp->read_all_layers ();
+
+  }
+
+  //  vibeic fork: foundry layer-map auto-discovery.
+  //  When neither an explicit map file nor an explicit layer map was supplied,
+  //  the bare DEF reader falls back to compact layer numbering (met1..met5 =
+  //  1..N) which produces a GDS that Magic can't read and that breaks LVS
+  //  (top routing + pin labels extract disconnected).  Commercial tools resolve
+  //  layers via the foundry tech/map file.  Two ways in, both preserving stock
+  //  behaviour by default:
+  //    * KLAYOUT_LEFDEF_LAYERMAP=<path[:path...]> — an EXPLICIT foundry map,
+  //      always applied (this is direct user intent, the normal PDK-integration
+  //      mechanism).
+  //    * KLAYOUT_LEFDEF_LAYERMAP_AUTODISCOVER=1 — OPT-IN scan for a '*.map' /
+  //      '*.layermap' file next to the DEF/LEF (the OpenLane/sky130 convention).
+  //      Off by default so we never silently pick up an unrelated map file that
+  //      happens to sit in the input directory.
+  if (! m_has_explicit_layer_mapping && m_layer_map.is_empty ()) {
+
+    std::vector<std::string> discovered;
+
+    std::string env_map = tl::get_env ("KLAYOUT_LEFDEF_LAYERMAP");
+    if (! env_map.empty ()) {
+      std::vector<std::string> paths = tl::split (env_map, ":");
+      for (std::vector<std::string>::const_iterator p = paths.begin (); p != paths.end (); ++p) {
+        if (! p->empty ()) {
+          discovered.push_back (*p);
+        }
+      }
+    }
+
+    if (discovered.empty () && ! base_path.empty () &&
+        tl::get_env ("KLAYOUT_LEFDEF_LAYERMAP_AUTODISCOVER", "0") == "1") {
+      //  opt-in same-directory discovery
+      tl::GlobPattern pat_map ("*.map"), pat_lm ("*.layermap");
+      std::vector<std::string> entries = tl::dir_entries (base_path, true /*files*/, false /*dirs*/);
+      std::sort (entries.begin (), entries.end ());
+      for (std::vector<std::string>::const_iterator e = entries.begin (); e != entries.end (); ++e) {
+        if (pat_map.match (*e) || pat_lm.match (*e)) {
+          discovered.push_back (tl::combine_path (base_path, *e));
+          break;
+        }
+      }
+    }
+
+    if (! discovered.empty ()) {
+      tl::log << tl::to_string (tr ("vibeic: applying LEF/DEF layer map")) << " " << discovered.front ();
+      read_map_files (discovered, layout, base_path);
+    }
 
   }
 
@@ -1912,6 +2175,14 @@ LEFDEFReaderState::finish (db::Layout &layout)
 
   //  On return we deliver the "canonical" map which lists the decorated name vs. the real ones.
   m_layer_map = lm;
+
+  //  vibeic fork: run the deferred merge-abutting pass now, at the very end of
+  //  the import.  do_read has returned (LayoutLocker released) and nothing reads
+  //  the reader-state cell caches after this point, so flattening + pruning the
+  //  design top cell here is safe.
+  if (m_merge_requested && layout.is_valid_cell_index (m_merge_top_cell)) {
+    finish_merge_abutting (layout, layout.cell (m_merge_top_cell));
+  }
 }
 
 void

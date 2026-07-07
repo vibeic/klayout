@@ -1677,6 +1677,13 @@ DEFImporter::read_components (db::Layout &layout, std::list<std::pair<std::strin
 
         ft = get_orient (false /*mandatory*/);
         d = pt - m->bbox.transformed (ft).lower_left ();
+        //  vibeic fork: snap the component placement displacement to the
+        //  manufacturing grid.  This is the dominant OFFGRID false-DRC source
+        //  (~76% on real silicon): KLayout otherwise enforces only the DBU grid,
+        //  so a displacement that is DBU-legal but off the manufacturing grid
+        //  shifts every vertex of the placed cell off-grid in the flat GDS.
+        //  No-op when disabled or already grid-legal.
+        d = reader_state ()->snap_mfg (d, layout);
         is_placed = true;
 
       } else if (test ("UNPLACED")) {
@@ -1689,6 +1696,7 @@ DEFImporter::read_components (db::Layout &layout, std::list<std::pair<std::strin
 
           ft = get_orient (false /*mandatory*/);
           d = pt - m->bbox.transformed (ft).lower_left ();
+          d = reader_state ()->snap_mfg (d, layout);  //  vibeic fork: manufacturing-grid snap
           is_placed = true;
 
         }
@@ -2050,6 +2058,14 @@ DEFImporter::do_read (db::Layout &layout)
     }
 
   }
+
+  //  vibeic fork: merge-abutting streamout (opt-in via KLAYOUT_LEFDEF_MERGE_ABUTTING=1).
+  //  Union same-layer polygons that touch across instance boundaries, matching
+  //  commercial streamout and removing the ~26% boundary false min-spacing/width
+  //  DRC population.  The merge is DEFERRED to finish() so it runs after import
+  //  completes; flattening here (during import) would dangle the reader-state's
+  //  cached macro/via cell pointers.
+  reader_state ()->request_merge_abutting (design.cell_index ());
 }
 
 }

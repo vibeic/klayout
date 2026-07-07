@@ -1,0 +1,24 @@
+# Foundry-style LEF/DEF layer map (sky130-like GDS numbers).
+# Format: <lef-layer-name> <purpose> <gds-layer> <gds-datatype>
+# This is the kind of map a PDK ships (e.g. OpenLane sky130A.map) and that the
+# bare KLayout DEF reader ignores by default (falling back to compact 1..N).
+met1 NET    68 20
+met1 PIN    68 16
+met1 LEFPIN 68 16
+met1 LEFOBS 68 22
+met1 SPNET  68 20
+met1 VIA    68 20
+via1 NET    67 44
+via1 VIA    67 44
+via1 SPNET  67 44
+met2 NET    69 20
+met2 PIN    69 16
+met2 LEFPIN 69 16
+met2 LEFOBS 69 22
+met2 SPNET  69 20
+met2 VIA    69 20
+met1 PINNAME    68 5
+met1 LEFPINNAME 68 5
+met2 PINNAME    69 5
+met2 LEFPINNAME 69 5
+DIEAREA ALL 235 4

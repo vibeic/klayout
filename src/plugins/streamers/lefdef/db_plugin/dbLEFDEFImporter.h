@@ -1311,6 +1311,87 @@ public:
    */
   void read_map_files (const std::vector<std::string> &filename, db::Layout &layout, const std::string &base_path);
 
+  //  vibeic fork: manufacturing-grid snap + merge-abutting streamout + layer-map
+  //  auto-discovery.  See dbLEFDEFImporter.cc for the rationale (matches the
+  //  behaviour of commercial streamout: Calibre/ICC2/Innovus snap all output to
+  //  MANUFACTURINGGRID, union abutting shapes at write time and resolve layer
+  //  numbers from the foundry map).  All three are design-agnostic.
+
+  /**
+   *  @brief vibeic fork: set the tech-LEF MANUFACTURINGGRID (in microns; 0 = unknown)
+   */
+  void set_manufacturing_grid (double g)
+  {
+    m_manufacturing_grid = g;
+  }
+
+  /**
+   *  @brief vibeic fork: the tech-LEF MANUFACTURINGGRID (in microns; 0 = unknown)
+   */
+  double manufacturing_grid () const
+  {
+    return m_manufacturing_grid;
+  }
+
+  /**
+   *  @brief vibeic fork: the manufacturing grid expressed in database units (0 = no snap)
+   */
+  db::Coord mfg_grid_dbu (const db::Layout &layout) const;
+
+  /**
+   *  @brief vibeic fork: true if manufacturing-grid snapping is active
+   *
+   *  Active by default when a grid is known; disabled with
+   *  KLAYOUT_LEFDEF_MFG_GRID_SNAP=0.  The grid may be forced/overridden (microns)
+   *  with KLAYOUT_LEFDEF_MFG_GRID=<value> when the LEF has no MANUFACTURINGGRID.
+   */
+  bool mfg_snap_enabled () const;
+
+  /**
+   *  @brief vibeic fork: snap a displacement vector to the manufacturing grid
+   */
+  db::Vector snap_mfg (const db::Vector &v, const db::Layout &layout) const;
+
+  /**
+   *  @brief vibeic fork: snap a point to the manufacturing grid
+   */
+  db::Point snap_mfg (const db::Point &p, const db::Layout &layout) const;
+
+  /**
+   *  @brief vibeic fork: snap a box to the manufacturing grid
+   */
+  db::Box snap_mfg (const db::Box &b, const db::Layout &layout) const;
+
+  /**
+   *  @brief vibeic fork: snap all vertices of a polygon to the manufacturing grid
+   */
+  db::Polygon snap_mfg (const db::Polygon &p, const db::Layout &layout) const;
+
+  /**
+   *  @brief vibeic fork: true if merge-abutting streamout is requested
+   *
+   *  Off by default; enabled with KLAYOUT_LEFDEF_MERGE_ABUTTING=1.
+   */
+  bool merge_abutting_enabled () const;
+
+  /**
+   *  @brief vibeic fork: union same-layer polygons touching across instance
+   *  boundaries in the top cell (flatten + per-layer merge at stream-out).
+   */
+  void finish_merge_abutting (db::Layout &layout, db::Cell &top) const;
+
+  /**
+   *  @brief vibeic fork: request a deferred merge-abutting pass on the DEF design
+   *  top cell.  The merge itself runs in finish() (after do_read has returned and
+   *  the reader-state cell caches are no longer used), never inline during import
+   *  where flattening would dangle the cached macro/via cell pointers.
+   */
+  void request_merge_abutting (db::cell_index_type top_cell)
+  {
+    m_merge_requested = true;
+    m_merge_top_cell = top_cell;
+  }
+
   /**
    *  @brief Gets the layer map
    */
@@ -1534,6 +1615,9 @@ private:
   bool m_create_layers;
   bool m_has_explicit_layer_mapping;
   int m_laynum;
+  double m_manufacturing_grid;   //  vibeic fork: tech-LEF MANUFACTURINGGRID (microns; 0 = unknown)
+  bool m_merge_requested;        //  vibeic fork: deferred merge-abutting request
+  db::cell_index_type m_merge_top_cell;
   std::map<std::string, int> m_default_number;
   const LEFDEFReaderOptions *mp_tech_comp;
   std::map<ViaKey, db::Cell *> m_via_cells;

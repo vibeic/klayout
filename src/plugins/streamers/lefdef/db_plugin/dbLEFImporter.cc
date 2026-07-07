@@ -1127,6 +1127,18 @@ LEFImporter::do_read (db::Layout &layout)
 
       expect ("UNITS");
 
+    } else if (test ("MANUFACTURINGGRID")) {
+
+      //  vibeic fork: capture the tech-LEF MANUFACTURINGGRID (microns).  KLayout
+      //  otherwise ignores it and enforces only the DBU grid on generated
+      //  geometry; the DEF/via importers use this value to snap instance
+      //  displacements + via/enclosure coordinates to the manufacturing grid.
+      double g = get_double ();
+      expect (";");
+      if (g > 0.0) {
+        reader_state ()->set_manufacturing_grid (g);
+      }
+
     } else if (test ("SPACING")) {
 
       LEFDEFSection section (this, "SPACING");
