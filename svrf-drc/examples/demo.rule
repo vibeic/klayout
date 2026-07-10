@@ -1,0 +1,38 @@
+// demo.rule — a synthetic Calibre/SVRF-format deck (NO vendor data).
+// Executed natively by KLayout via run_svrf_drc.py (no compiler, no .drc file).
+
+LAYER metal1 34 0
+LAYER metal2 36 0
+LAYER poly   10 0
+LAYER nact   12 0
+
+// derived layers run as native KLayout Region algebra
+gate = poly AND nact
+
+// metal1 squares are 0.10um apart -> violates 0.14 spacing, passes 0.08.
+SPACE.M1.FAIL {
+  EXTERNAL metal1 < 0.14 ABUT < 90 REGION
+}
+SPACE.M1.PASS {
+  EXTERNAL metal1 < 0.08 ABUT < 90 REGION
+}
+
+// 1.0um-wide metal1, 90deg corners -> width passes (corners skipped at ignore_angle=90).
+WIDTH.M1.PASS {
+  INTERNAL metal1 < 0.50 ABUT < 90 REGION
+}
+
+// AREA: the 0.2x0.2 metal2 square (0.04um^2) is below 0.05 -> FAIL.
+AREA.M2.FAIL {
+  AREA metal2 < 0.05
+}
+
+// width of the boolean-derived gate (1.0um) -> PASS.
+GATE.W.PASS {
+  INTERNAL gate < 0.05 ABUT < 90 REGION
+}
+
+// connectivity condition -> honestly SKIPPED unless net extraction is wired.
+SPACE.M1M2.NET {
+  EXTERNAL metal1 metal2 < 0.30 NOT CONNECTED REGION
+}

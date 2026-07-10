@@ -1,0 +1,21 @@
+// conn.rule — connectivity (net-aware) demo, synthetic (NO vendor data).
+// KLayout extracts nets natively (LayoutToNetlist) and runs the net-aware check.
+
+LAYER metal1 34 0
+LAYER metal2 36 0
+LAYER via    35 0
+
+// the connectivity stack: metal1 and metal2 join through a via
+CONNECT metal1 metal2 BY via
+
+// NOT CONNECTED: flag metal1/metal2 within 0.30 only when on DIFFERENT nets
+//   -> only the unbridged A2|B2 pair -> FAIL 1
+NOTCON.M1M2 {
+  EXTERNAL metal1 metal2 < 0.30 NOT CONNECTED REGION
+}
+
+// CONNECTED: flag only when on the SAME net
+//   -> only the via-bridged A1|B1 pair -> FAIL 1
+CONN.M1M2 {
+  EXTERNAL metal1 metal2 < 0.30 CONNECTED REGION
+}
