@@ -49,7 +49,7 @@ def test_layers():
 
 def test_derivations_bool_size_select():
     d = _by(parse_deck(DECK), "derivations")
-    assert d["gate"].kind == "bool" and d["gate"].bool_sym == "&"
+    assert d["gate"].kind == "bool_expr" and "poly" in d["gate"].operands
     assert d["bigm1"].kind == "size" and d["bigm1"].value == 0.10
     assert d["sel1"].kind == "select" and d["sel1"].select_op == "INTERACT"
 
@@ -80,3 +80,63 @@ def test_connectivity_modes():
     r = _by(parse_deck(DECK), "rules")
     assert r["WELL.NET.1"].connectivity == "different"   # NOT CONNECTED
     assert r["SAME.NET.1"].connectivity == "same"        # CONNECTED
+
+
+# ── edge pipeline / density / net-ratio classification (edges enhancement) ────
+EDGE_DECK = """
+LAYER a 11 0
+LAYER b 12 0
+me    = a EDGE
+ain   = a INSIDE EDGE b
+aout  = a OUTSIDE EDGE b
+cae   = a COINCIDENT EDGE b
+cin   = a COINCIDENT INSIDE EDGE b
+longs = me LENGTH > 1.0
+angs  = me ANGLE == 90
+strip = a EXPAND EDGE OUTSIDE BY 0.1
+nc    = a NET AREA RATIO b == 0
+DEN.1 {
+  DENSITY a < 0.2 WINDOW 100.0 STEP 50.0
+}
+"""
+
+
+def test_edge_modifiers_are_edge_typed():
+    d = _by(parse_deck(EDGE_DECK), "derivations")
+    for name in ("me", "ain", "aout", "cae", "cin", "longs", "angs"):
+        assert d[name].edge_typed is True, name
+    assert d["me"].select_op == "EDGE"
+    assert d["ain"].select_op == "INSIDE" and d["ain"].operands == ["a", "b"]
+    assert d["aout"].select_op == "OUTSIDE"
+    assert d["cae"].select_op == "COINCIDENT"
+    assert d["cin"].select_op == "COINCIDENT" and d["cin"].params["inside"] is True
+
+
+def test_length_angle_metric_select():
+    d = _by(parse_deck(EDGE_DECK), "derivations")
+    assert d["longs"].kind == "metric_select" and d["longs"].metric == "LENGTH"
+    assert d["longs"].bounds == (1.0, None)
+    assert d["angs"].kind == "metric_select" and d["angs"].metric == "ANGLE"
+    assert d["angs"].bounds == (90.0, 90.0)   # exact angle
+
+
+def test_expand_edge_is_region_not_edge():
+    # EXPAND EDGE contains 'EDGE' but yields a polygon strip -> must NOT be edge-typed
+    d = _by(parse_deck(EDGE_DECK), "derivations")
+    assert d["strip"].kind == "expand" and d["strip"].edge_typed is False
+    assert d["strip"].params["outside"] is True and d["strip"].value == 0.1
+
+
+def test_net_area_ratio_is_derivation_not_area_rule():
+    deck = parse_deck(EDGE_DECK)
+    d = _by(deck, "derivations")
+    # the embedded AREA token must NOT turn this into an AREA rule
+    assert "nc" not in _by(deck, "rules")
+    assert d["nc"].kind == "net_ratio" and d["nc"].operands == ["a", "b"]
+    assert d["nc"].params == {"cmp": "==", "thr": 0.0}
+
+
+def test_density_window_step_parsed():
+    r = _by(parse_deck(EDGE_DECK), "rules")
+    assert r["DEN.1"].op == "DENSITY" and r["DEN.1"].supported is True
+    assert r["DEN.1"].window == 100.0 and r["DEN.1"].step == 50.0

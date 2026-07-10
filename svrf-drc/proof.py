@@ -29,7 +29,7 @@ def _gen(script, out):
 def _verdicts(deck_file, gds):
     text = open(os.path.join(root, "examples", deck_file)).read()
     eng = Engine(gds, text)
-    return {r.name: eng.run_rule(r) for r in eng.deck.rules}
+    return {r.name: (verdict, info) for verdict, r, info in eng.execute()}
 
 
 def _check(got, expected):
