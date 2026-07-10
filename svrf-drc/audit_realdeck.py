@@ -9,7 +9,8 @@ from svrf_klayout.run_svrf_drc import Engine
 text = open(deck_path, encoding="utf-8", errors="replace").read()
 deck = parse_deck(text)
 ly = pya.Layout(); ly.dbu=0.001; top=ly.create_cell("TOP")
-for (num,dt) in deck.layers.values(): ly.layer(num,dt)
+for binding in deck.layers.values():
+    for (num,dt) in binding: ly.layer(num,dt)
 gds="/tmp/empty_layers.gds"; ly.write(gds)
 
 t0=time.time()

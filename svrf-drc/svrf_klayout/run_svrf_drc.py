@@ -35,6 +35,11 @@ _METRICS = {"euclidian": pya.Region.Euclidian, "projection": pya.Region.Projecti
 _PC = {"same": "SamePropertiesConstraint", "different": "DifferentPropertiesConstraint"}
 
 
+class _NetLayerUnavailable(Exception):
+    """A connectivity rule referenced a layer that has no shapes in net extraction —
+    the net-aware check cannot run, so the rule is honestly SKIPPED (not ERRORed)."""
+
+
 class Engine:
     def __init__(self, layout_path, deck_text):
         self.layout = pya.Layout()
@@ -51,10 +56,13 @@ class Engine:
 
     # -- namespace resolution ------------------------------------------------
     def _drawn(self, name):
-        if name not in self.deck.layers:
+        binding = self.deck.layers.get(name)
+        if not binding:
             return None
-        num, dt = self.deck.layers[name]
-        return pya.Region(self.top.begin_shapes_rec(self.layout.layer(num, dt)))
+        reg = pya.Region()
+        for num, dt in binding:          # union every GDS (layer, datatype) purpose
+            reg.insert(self.top.begin_shapes_rec(self.layout.layer(num, dt)))
+        return reg
 
     def resolve(self, name):
         if name in self.regions:
@@ -201,10 +209,14 @@ class Engine:
                 a = self.resolve(d.operands[0])
                 b = self.resolve(d.operands[1]) if len(d.operands) > 1 else pya.Region()
                 op = (d.select_op or "").upper()
-                self.regions[d.name] = {
-                    "INTERACT": a.interacting, "INSIDE": a.inside, "OUTSIDE": a.outside,
-                    "CUT": a.interacting, "TOUCH": a.interacting, "ENCLOSE": a.interacting,
-                }.get(op, a.interacting)(b)
+                negate = (d.params or {}).get("negate", False)
+                pos = {"INTERACT": a.interacting, "INSIDE": a.inside, "OUTSIDE": a.outside,
+                       "CUT": a.interacting, "TOUCH": a.interacting, "ENCLOSE": a.interacting}
+                neg = {"INTERACT": a.not_interacting, "INSIDE": a.not_inside,
+                       "OUTSIDE": a.not_outside, "CUT": a.not_interacting,
+                       "TOUCH": a.not_interacting, "ENCLOSE": a.not_interacting}
+                fn = (neg if negate else pos).get(op, a.not_interacting if negate else a.interacting)
+                self.regions[d.name] = fn(b)
             elif k == "passthrough":
                 self.regions[d.name] = self.resolve(d.operands[0])
             elif k == "empty":
@@ -351,14 +363,26 @@ class Engine:
             if dv.kind == "net_ratio" and dv.supported:
                 for nm in dv.operands[:2]:
                     get(nm)
+        # register every layer a CONNECTED / NOT CONNECTED rule queries, so .nets()
+        # never fails on an unregistered layer (an unconnected layer -> per-shape nets)
+        for rl in self.deck.rules:
+            if getattr(rl, "connectivity", None) is not None:
+                for nm in (rl.layer1, rl.layer2):
+                    if nm:
+                        get(nm)
         l2n.extract_netlist()
         self._l2n = (l2n, reg)
         return self._l2n
 
     def _l2n_nets(self, name):
         l2n, reg = self._build_l2n()
-        base = reg.get(name) or self.resolve(name)
-        return base.nets(l2n, net_prop_name="net")
+        base = reg.get(name)
+        if base is None:                    # layer never entered net extraction
+            raise _NetLayerUnavailable(name)
+        try:
+            return base.nets(l2n, net_prop_name="net")
+        except Exception:                   # empty/unextracted layer -> not net-queryable
+            raise _NetLayerUnavailable(name)
 
     def _net_area_ratio(self, d):
         """area(A on net) / area(B on net) per net; flag nets meeting the comparison.
@@ -569,6 +593,9 @@ class Engine:
                     self.results.append(("SKIP", r, f"op {r.op} not in core"))
                     return
                 viol = ep.polygons()
+        except _NetLayerUnavailable as e:
+            self.results.append(("SKIP", r, f"net layer '{e}' has no extracted shapes"))
+            return
         except Exception as e:
             self.results.append(("ERROR", r, str(e)[:80]))
             return

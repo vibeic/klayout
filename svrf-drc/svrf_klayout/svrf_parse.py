@@ -23,6 +23,14 @@ _BLOCK_COMMENT = re.compile(r'/\*.*?\*/', re.DOTALL)
 _LAYER_RE = re.compile(
     r'^\s*LAYER\s+([A-Za-z_][\w.$]*)\s+(\d+)(?:\s+(\d+))?\s*$',
     re.IGNORECASE | re.MULTILINE)
+# Direct form:  LAYER <name> <gds> <datatype>   (name binds straight to a GDS purpose)
+_LAYER_DIRECT_RE = re.compile(
+    r'^\s*LAYER\s+([A-Za-z_][\w.$]*)\s+(\d+)\s+(\d+)\s*$', re.IGNORECASE | re.MULTILINE)
+# Two-level Calibre form:  LAYER <name> <index>   +   LAYER MAP <gds> DATATYPE <dt> <index>
+_LAYER_INDEX_RE = re.compile(
+    r'^\s*LAYER\s+([A-Za-z_][\w.$]*)\s+(\d+)\s*$', re.IGNORECASE | re.MULTILINE)
+_LAYER_MAP_RE = re.compile(
+    r'^\s*LAYER\s+MAP\s+(\d+)\s+DATATYPE\s+(\d+)\s+(\d+)\s*$', re.IGNORECASE | re.MULTILINE)
 
 # a geometric measurement (rule) with an optional modifier tail
 _MEAS_RE = re.compile(
@@ -55,10 +63,28 @@ def strip_comments(text: str) -> str:
     return _LINE_COMMENT.sub('', _BLOCK_COMMENT.sub('', text))
 
 
-def parse_layers(text: str) -> dict[str, tuple[int, int]]:
-    out: dict[str, tuple[int, int]] = {}
-    for m in _LAYER_RE.finditer(text):
-        out[m.group(1)] = (int(m.group(2)), int(m.group(3) or 0))
+def parse_layers(text: str) -> dict[str, list[tuple[int, int]]]:
+    """Resolve each layer NAME to the list of GDS (layer, datatype) purposes it
+    draws from. Two Calibre idioms, both supported:
+
+      DIRECT     LAYER <name> <gds> <datatype>            -> name = [(gds, dt)]
+      TWO-LEVEL  LAYER <name> <index>                     -> name -> index, then
+                 LAYER MAP <gds> DATATYPE <dt> <index>    -> index -> [(gds, dt), ...]
+
+    A real foundry deck uses the two-level form (the bare number is an INTERNAL
+    index, NOT a GDS layer); the DIRECT form is what small/synthetic decks use.
+    A name may union several GDS purposes (multiple MAP lines to one index)."""
+    idx_to_gds: dict[int, list[tuple[int, int]]] = {}
+    for m in _LAYER_MAP_RE.finditer(text):
+        idx_to_gds.setdefault(int(m.group(3)), []).append((int(m.group(1)), int(m.group(2))))
+    out: dict[str, list[tuple[int, int]]] = {}
+    for m in _LAYER_DIRECT_RE.finditer(text):          # name gds datatype
+        out[m.group(1)] = [(int(m.group(2)), int(m.group(3)))]
+    for m in _LAYER_INDEX_RE.finditer(text):           # name index  (+ MAP table)
+        name, idx = m.group(1), int(m.group(2))
+        if name in out:
+            continue                                   # a direct binding already won
+        out[name] = list(idx_to_gds[idx]) if idx in idx_to_gds else [(idx, 0)]
     return out
 
 
@@ -241,6 +267,17 @@ def _parse_derivation(name: str, expr: str) -> Optional[Derivation]:
         d.supported = False; d.reason = "empty rhs"; return d
     if len(toks) == 1 and up[0] == "EMPTY":
         d.kind = "empty"; return d
+    # Calibre PREFIX boolean (the real-deck form): `<OP> layerA layerB [layerC...]`
+    # where OP is the FIRST token and every operand is a plain layer. Semantics:
+    #   AND=intersect all · OR=union all · NOT=A minus union(rest) · XOR=chain xor.
+    # (Calibre writes booleans operator-first; the infix `a AND b` form below is the
+    # synthetic/human style. `(` is stripped into a space above, so a genuinely
+    # nested RHS keeps its inner op tokens and is REJECTED here — it is not flat.)
+    if up[0] in _BOOL_OPS and len(toks) >= 3 and all(
+            re.fullmatch(r'[A-Za-z_][\w.$]*', t) and t.upper() not in _KEYWORDS
+            for t in toks[1:]):
+        d.kind = "bool"; d.bool_sym = _BOOL_OPS[up[0]]; d.operands = toks[1:]
+        return d
     # pure boolean expression (any mix of AND/OR/NOT/XOR + parens over plain layers)
     rawtoks = re.findall(r'\(|\)|[^\s()]+', expr)
     if _pure_boolean(rawtoks):
@@ -336,10 +373,14 @@ def _parse_derivation(name: str, expr: str) -> Optional[Derivation]:
         if not d.operands:
             d.supported = False; d.edge_typed = False; d.reason = "edge op without a layer"
         return d
-    # region-returning selects (INTERACT / INSIDE / OUTSIDE / CUT / TOUCH / ENCLOSE)
+    # region-returning selects (INTERACT / INSIDE / OUTSIDE / CUT / TOUCH / ENCLOSE),
+    # optionally NEGATED: `A NOT OUTSIDE B` / prefix `NOT OUTSIDE A B` selects the
+    # COMPLEMENT (A that is NOT outside B). A flat single-op line, so a present NOT
+    # negates this select (never a boolean subtract — that path is handled above).
     for t in up:
         if t in _SELECT_OPS:
             d.kind = "select"; d.select_op = t; d.operands = lt[:2]
+            d.params = {"negate": "NOT" in up}
             if not lt:
                 d.supported = False; d.reason = "select without a layer"
             return d

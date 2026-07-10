@@ -44,7 +44,24 @@ def _by(deck, kind):
 
 def test_layers():
     lm = parse_layers(DECK)
-    assert lm["metal1"] == (34, 0) and lm["via1"] == (35, 0)
+    assert lm["metal1"] == [(34, 0)] and lm["via1"] == [(35, 0)]
+
+
+def test_two_level_layer_map():
+    # Calibre two-level idiom: name -> index, LAYER MAP gds DATATYPE dt index.
+    # (Synthetic numbers — not any real PDK's assignment.)
+    deck = """
+    LAYER metA 810
+    LAYER MAP 42 DATATYPE 0 810
+    LAYER metB 811
+    LAYER MAP 43 DATATYPE 0 811
+    LAYER MAP 43 DATATYPE 5 811
+    LAYER internal_only 700
+    """
+    lm = parse_layers(deck)
+    assert lm["metA"] == [(42, 0)]                # index 810 resolves to GDS 42/0
+    assert lm["metB"] == [(43, 0), (43, 5)]       # multi-purpose union
+    assert lm["internal_only"] == [(700, 0)]      # no MAP -> falls back to the bare number
 
 
 def test_derivations_bool_size_select():
@@ -140,3 +157,31 @@ def test_density_window_step_parsed():
     r = _by(parse_deck(EDGE_DECK), "rules")
     assert r["DEN.1"].op == "DENSITY" and r["DEN.1"].supported is True
     assert r["DEN.1"].window == 100.0 and r["DEN.1"].step == 50.0
+
+
+# ── real-deck idioms: Calibre PREFIX booleans + NEGATED selects ───────────────
+def _der(rhs):
+    from svrf_klayout.svrf_parse import _parse_derivation
+    return _parse_derivation("x", rhs)
+
+
+def test_prefix_boolean_flat():
+    # Calibre writes booleans operator-FIRST; each collapses to the fold executor.
+    assert _der("AND a b").kind == "bool" and _der("AND a b").bool_sym == "&"
+    assert _der("OR a b c").operands == ["a", "b", "c"]
+    d = _der("NOT met1 dcty")
+    assert d.kind == "bool" and d.bool_sym == "-" and d.operands == ["met1", "dcty"]
+    assert _der("XOR a b").bool_sym == "^"
+    # infix (synthetic/human) form still parses as a boolean expression
+    assert _der("poly AND nact").kind == "bool_expr"
+
+
+def test_negated_select():
+    # `NOT OUTSIDE a b` selects the COMPLEMENT (a NOT outside b), not plain OUTSIDE
+    d = _der("NOT OUTSIDE pact guard")
+    assert d.kind == "select" and d.select_op == "OUTSIDE"
+    assert d.params["negate"] is True and d.operands == ["pact", "guard"]
+    d2 = _der("NOT INTERACT a b")
+    assert d2.select_op == "INTERACT" and d2.params["negate"] is True
+    # un-negated select stays un-negated
+    assert _der("a INSIDE b").params["negate"] is False
