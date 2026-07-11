@@ -107,6 +107,17 @@ db::metrics_type map_metrics (const std::string &m)
   return db::Euclidian;
 }
 
+//  A boolean derivation param (negate/inside/outside/inner/outer) is stored by the
+//  parser as the string "1"/"0" and the KEY IS ALWAYS PRESENT. So test the VALUE,
+//  not key existence (matches the reference `params.get(flag)` truthiness). Value-
+//  bearing params (w/h/aspect/cmp/thr) are set only when applicable -> those use
+//  find() directly.
+bool pflag (const std::map<std::string, std::string> &params, const char *key)
+{
+  std::map<std::string, std::string>::const_iterator it = params.find (key);
+  return it != params.end () && it->second == "1";
+}
+
 //  A verdict tally in first-appearance order, rendered as a Python dict repr:
 //    {'PASS': 4523, 'FAIL': 10}
 struct Tally
@@ -498,17 +509,15 @@ db::Edges SVRFEngine::build_edges (const SVRFDerivation &d)
       return a;
     }
     db::Edges be = b_is_edge ? as_edges (d.operands[1]) : resolve (d.operands[1]).edges ();
-    std::map<std::string, std::string>::const_iterator pin = d.params.find ("inside");
-    std::map<std::string, std::string>::const_iterator pou = d.params.find ("outside");
-    int want = pin != d.params.end () ? 1 : (pou != d.params.end () ? 0 : -1);
+    int want = pflag (d.params, "inside") ? 1 : (pflag (d.params, "outside") ? 0 : -1);
     return coincident_edges (a, be, want);
   }
   //  plain EDGE / INNER EDGE / OUTER EDGE
   db::Region base = resolve (d.operands[0]);
-  if (d.params.find ("inner") != d.params.end ()) {
+  if (pflag (d.params, "inner")) {
     return base.holes ().edges ();
   }
-  if (d.params.find ("outer") != d.params.end ()) {
+  if (pflag (d.params, "outer")) {
     return base.hulls ().edges ();
   }
   return base.edges ();
@@ -558,7 +567,7 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d)
       db::Region b = d.operands.size () > 1 ? resolve (d.operands[1]) : db::Region ();
       std::string op = d.select_op;
       for (char &c : op) c = (char) std::toupper ((unsigned char) c);
-      bool negate = d.params.find ("negate") != d.params.end ();
+      bool negate = pflag (d.params, "negate");
       db::Region res;
       if (op == "INSIDE") {
         res = negate ? a.selected_not_inside (b) : a.selected_inside (b);
@@ -591,9 +600,9 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d)
       db::Edges edges = resolve (d.operands[0]).edges ();
       db::Coord w = to_dbu (std::fabs (d.has_value ? d.value : 0.0));
       db::Region ex;
-      if (d.params.find ("inside") != d.params.end ()) {
+      if (pflag (d.params, "inside")) {
         edges.extended (ex, 0, 0, 0, w, false);        // extended_in
-      } else if (d.params.find ("outside") != d.params.end ()) {
+      } else if (pflag (d.params, "outside")) {
         edges.extended (ex, 0, 0, w, 0, false);        // extended_out
       } else {
         edges.extended (ex, 0, 0, w, w, false);
@@ -608,6 +617,8 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d)
       m_regions[d.name] = db::Region ();
     }
   } catch (...) {
+    //  an unsupported/failed derivation -> empty region + unmodeled (dependent
+    //  rules honestly SKIP rather than false-PASS)
     m_unmodeled.insert (d.name);
     m_regions[d.name] = db::Region ();
   }
@@ -1001,8 +1012,19 @@ db::Region SVRFEngine::net_area_ratio (const SVRFDerivation &d)
   const std::string &A = d.operands[0];
   const std::string &B = d.operands[1];
   build_l2n ();
-  db::Region ra = m_l2n_layers.count (A) ? m_l2n_layers[A] : resolve (A);
-  db::Region rb = m_l2n_layers.count (B) ? m_l2n_layers[B] : resolve (B);
+  //  Use the REGISTERED region objects (references), not copies: shapes_of_net()
+  //  resolves the layer via the DSS layer_for_flat map keyed on the region's
+  //  delegate identity -- a copy has a different identity and would throw
+  //  "Non-hierarchical layers cannot be used in netlist extraction". build_l2n()
+  //  registers every net_ratio operand, so both are present; if somehow not, the
+  //  ratio is unqueryable -> empty error layer (matches the reference no-violation).
+  std::map<std::string, db::Region>::iterator ita = m_l2n_layers.find (A);
+  std::map<std::string, db::Region>::iterator itb = m_l2n_layers.find (B);
+  if (ita == m_l2n_layers.end () || itb == m_l2n_layers.end ()) {
+    return db::Region ();
+  }
+  db::Region &ra = ita->second;
+  db::Region &rb = itb->second;
 
   std::string cmp = "==";
   double thr = 0.0;

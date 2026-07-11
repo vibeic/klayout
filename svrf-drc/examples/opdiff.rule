@@ -1,0 +1,40 @@
+// opdiff.rule -- SYNTHETIC. Isolate the op forms that diverged on the real deck:
+//   net_ratio (NET AREA RATIO), select-negate (NOT INTERACT), CUT, prefix OR/NOT.
+// NO vendor data.
+
+LAYER m1  20 0
+LAYER m2  21 0
+LAYER via 22 0
+LAYER nw  23 0
+
+CONNECT m1 m2 BY via
+
+// net_ratio (the SKIP class)
+nr = m1 NET AREA RATIO m2 == 0
+NR_CHK {
+  COPY nr
+}
+
+// select negate: "NOT INTERACT a b"  (floating_nact_check2 form)
+ni = NOT INTERACT m1 nw
+NI_CHK {
+  COPY ni
+}
+
+// CUT select (basic__err form)
+cu = CUT m1 nw
+CU_CHK {
+  COPY cu
+}
+
+// prefix boolean OR (mom_via_align form)
+orl = OR m1 m2
+OR_CHK {
+  COPY orl
+}
+
+// prefix boolean NOT (err__fuse form)
+notl = NOT m1 nw
+NOT_CHK {
+  COPY notl
+}

@@ -114,6 +114,35 @@ buddy binary only.
    `drc-fix` SKILL + 2 tests reword). **Verify byte-parity native-vs-Python on the
    commercial-PDK deck BEFORE deleting Python.** Then remove `svrf_klayout/*.py` + `.lym`.
 
+   **★ REAL-DECK PARITY GATE PASSED (the load-bearing safety check for step 4).**
+   The native `svrfdrc` buddy binary is **byte-identical** to the reference
+   `run_svrf_drc.py` on the REAL commercial **a commercial foundry commercial-PDK** deck
+   (`the commercial DRC rule deck`, 87,620 lines → 224 layers / 15,897 derivations /
+   4,533 rules) run on the spm sign-off GDS — final tally `{'PASS': 4523, 'FAIL': 10}`
+   on both sides, empty diff. Buddy: 1.03 s, 100 MB. (Deck is NDA — verified locally,
+   never committed; test fixtures here are all SYNTHETIC.)
+   - **Two real engine bugs the synthetic corpora missed, found by this gate + fixed:**
+     1. **net-area-ratio copy-vs-reference:** `net_area_ratio` took the registered
+        operand region BY COPY; `LayoutToNetlist::shapes_of_net` resolves the layer via
+        the DSS `layer_for_flat` map keyed on delegate identity, so a copy threw
+        "Non-hierarchical layers cannot be used in netlist extraction" → the derivation
+        went `unmodeled` → COPY reported SKIP instead of PASS. Fix: hold the registered
+        regions by reference (mirrors the reference `reg.get(nm)`).
+     2. **boolean-param key-vs-value (general):** the C++ parser stores boolean select/
+        derivation flags (`negate`/`inside`/`outside`/`inner`/`outer`) as the string
+        `"1"`/`"0"` with the KEY ALWAYS PRESENT; the engine tested `params.find(k)!=end()`
+        (key existence → always true) instead of the value. So e.g. `INTERACT a b` was
+        executed as `NOT INTERACT` → `a interacting <empty> = a` instead of `= {}` and a
+        whole fuse/mom chain fired. Fix: a `pflag()` helper testing value `== "1"`, wired
+        into all 5 flag sites. (Value-bearing params w/h/aspect/cmp/thr are set
+        conditionally, so key-presence stays correct there.)
+   - Regression fixtures added (SYNTHETIC): `examples/opdiff.rule` (select/prefix-bool/
+     net-ratio) + `examples/empty.rule` (ops with an empty operand — the pflag bug);
+     `tests/run_engine_parity.sh` now diffs all 4 corpora.
+
+   Remaining step-4 work (mechanical, no NDA blockers): re-bake the image, rewire the 6
+   plugin touchpoints, then delete the Python.
+
 ## Effort / risk
 
 ~1.5–3 engineer-weeks (parser mechanical; engine + RegionCheckOptions mapping +

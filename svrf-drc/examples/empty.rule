@@ -1,0 +1,27 @@
+LAYER a 20 0
+LAYER b 21 0
+LAYER e 99 0
+ai = INTERACT a e
+an = AND a e
+ax = XOR a e
+anot = NOT a e
+ao = OR a e
+ani = NOT INTERACT a e
+AI {
+  COPY ai
+}
+AN {
+  COPY an
+}
+AX {
+  COPY ax
+}
+ANOT {
+  COPY anot
+}
+AO {
+  COPY ao
+}
+ANI {
+  COPY ani
+}

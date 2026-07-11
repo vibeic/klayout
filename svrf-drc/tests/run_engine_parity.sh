@@ -38,33 +38,47 @@ g++ -std=c++17 -O1 -DHAVE_PYTHON \
   -Wl,--no-as-needed -L"$KBIN/db_plugins" -lgds2 -Wl,--as-needed \
   -Wl,-rpath,"$KBIN" -Wl,-rpath,"$KBIN/db_plugins" -o "$BIN"
 
-cp "$SVRF/examples/coverage.rule"  "$WORK/"
-cp "$SVRF/examples/coverage2.rule" "$WORK/"
-cp "$HERE/gen_synth_gds.py"        "$WORK/"
-cp "$HERE/gen_synth2_gds.py"       "$WORK/"
+#  corpus rows: "<deck-basename> <gds-basename> <gen-script>"
+#    coverage   -- every dispatch branch (4 FAIL + 4 PASS + 1 SKIP)
+#    coverage2  -- separation/enclosure/notch/width/bool-COPY forced non-zero
+#    opdiff     -- select(INTERACT/CUT/NOT-INTERACT) + prefix OR/NOT/XOR + NET AREA RATIO
+#    empty      -- boolean/select ops with an EMPTY operand (the pflag key-vs-value bug)
+CORPORA=(
+  "coverage  synth  gen_synth_gds.py"
+  "coverage2 synth2 gen_synth2_gds.py"
+  "opdiff    opdiff gen_opdiff_gds.py"
+  "empty     empty  gen_empty_gds.py"
+)
+for row in "${CORPORA[@]}"; do
+  set -- $row
+  cp "$SVRF/examples/$1.rule" "$WORK/"
+  cp "$HERE/$3"               "$WORK/"
+done
 
 echo "== 2. generate synthetic GDS + Python golden (container) =="
-docker run --rm --entrypoint bash -v "$SVRF":/myfork -v "$WORK":/work "$IMAGE" -lc '
-  export PATH=/foss/tools/klayout:$PATH
-  klayout -b -r /work/gen_synth_gds.py  >/dev/null 2>&1
-  klayout -b -r /work/gen_synth2_gds.py >/dev/null 2>&1
-  klayout -b -r /myfork/svrf_klayout/run_svrf_drc.py -rd root=/myfork \
-     -rd deck=/work/coverage.rule  -rd layout=/work/synth.gds  -rd report=/work/golden.txt  >/dev/null 2>&1
-  klayout -b -r /myfork/svrf_klayout/run_svrf_drc.py -rd root=/myfork \
-     -rd deck=/work/coverage2.rule -rd layout=/work/synth2.gds -rd report=/work/golden2.txt >/dev/null 2>&1
-'
+GEN=""; GOLD=""
+for row in "${CORPORA[@]}"; do
+  set -- $row
+  GEN="$GEN klayout -b -r /work/$3 >/dev/null 2>&1;"
+  GOLD="$GOLD klayout -b -r /myfork/svrf_klayout/run_svrf_drc.py -rd root=/myfork -rd deck=/work/$1.rule -rd layout=/work/$2.gds -rd report=/work/${1}_golden.txt >/dev/null 2>&1;"
+done
+docker run --rm --entrypoint bash -v "$SVRF":/myfork -v "$WORK":/work "$IMAGE" -lc "
+  export PATH=/foss/tools/klayout:\$PATH
+  $GEN
+  $GOLD
+"
 
 echo "== 3. run native engine + diff =="
 rc=0
-for n in "coverage synth golden" "coverage2 synth2 golden2"; do
-  set -- $n
-  deck="$1"; gds="$2"; gold="$3"
+for row in "${CORPORA[@]}"; do
+  set -- $row
+  deck="$1"; gds="$2"
   "$BIN" "$WORK/$deck.rule" "$WORK/$gds.gds" "$WORK/${deck}_cpp.txt" \
      "KLayout 0.30.9" "/work/$deck.rule" "/work/$gds.gds"
-  if diff "$WORK/$gold.txt" "$WORK/${deck}_cpp.txt" >/dev/null; then
+  if diff "$WORK/${deck}_golden.txt" "$WORK/${deck}_cpp.txt" >/dev/null; then
     echo "  $deck: PASS (byte-identical)"
   else
-    echo "  $deck: FAIL"; diff "$WORK/$gold.txt" "$WORK/${deck}_cpp.txt" || true; rc=1
+    echo "  $deck: FAIL"; diff "$WORK/${deck}_golden.txt" "$WORK/${deck}_cpp.txt" || true; rc=1
   fi
 done
 
