@@ -15,6 +15,7 @@ SUBDIRS = \
   strmcmp \
   strmxor \
   strmrun \
+  svrfdrc \
 
 strm2cif.depends += bd
 strm2dxf.depends += bd
@@ -28,3 +29,4 @@ strmclip.depends += bd
 strmcmp.depends += bd
 strmxor.depends += bd
 strmrun.depends += bd
+svrfdrc.depends += bd

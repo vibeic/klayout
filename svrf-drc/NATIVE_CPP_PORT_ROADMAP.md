@@ -84,7 +84,29 @@ buddy binary only.
      vs the fork's current 522) — moot, since increment 4 re-bakes the image to the native
      C++ binary and drops the Python entirely.
 3. **buddy `svrfdrc`** — `src/buddies/src/bd/svrfdrc.cc` (mirror `strmxor.cc`), add to
-   `bd.pro` SOURCES + `src/buddies/src/svrfdrc/svrfdrc.pro` + `src.pro`.
+   `bd.pro` SOURCES + `src/buddies/src/svrfdrc/svrfdrc.pro` + `src.pro`. **[DONE]**
+   - `bd/svrfdrc.cc`: `BD_PUBLIC int svrfdrc(argc,argv)` — `tl::CommandLineOptions`
+     parses `svrfdrc <deck> <layout> <report> [--cell=TOP]`, reads the deck,
+     `db::parse_deck` → `db::SVRFEngine` → `write_report`. Version string
+     "KLayout <KLAYOUT_VERSION>" built from the compile macro (NOT version.h, whose
+     file-scope globals would multiply-define in klayout_bd).
+   - **Build wiring:** `bd.pro` compiles `svrfdrc.cc` + the two engine sources
+     (`$$PWD/../../../plugins/tools/svrf_drc/db_plugin/dbSVRF{Deck,Engine}.cc`) into
+     `libklayout_bd` (+ that dir on INCLUDEPATH); `svrfdrc/svrfdrc.pro` =
+     `include(buddy_app.pri)` (TARGET auto = svrfdrc, main from bd/main.cc via
+     `BD_TARGET`); `src.pro` SUBDIRS += svrfdrc, `svrfdrc.depends += bd`. The
+     `src/plugins/tools/svrf_drc/svrf_drc.pro` is an EMPTY `TEMPLATE=subdirs` project
+     so the `tools.pro` auto-glob (`$files($$PWD/*)`) accepts the folder without
+     building a module of its own (the sources ship via klayout_bd).
+   - **Engine ported to `-std=c++11`** (the KLayout build standard, not c++17):
+     `py_float_str` reimplemented without `<charconv>` (shortest round-trip via
+     increasing-precision `%f`/`%g`, Python fixed-vs-scientific threshold at
+     exp∈[-4,16); unit-checked against Python `str()` over 25 values incl. 400.0/4000.0);
+     `SVRFStatement` given explicit ctors (default-member-initializer disqualifies
+     aggregate init under c++11).
+   - **VERIFIED end-to-end:** built via `build.sh -without-qt -noruby` (KLayout 0.30.9);
+     `bin/svrfdrc` runs as `svrfdrc <deck> <layout> <report>` (NO script, NO `-r`, NO
+     pya) and is **byte-identical** to the reference Python on both synthetic corpora.
 4. **container re-bake + plugin rewire + delete Python** — bump vibeic-eda
    `ARG KLAYOUT_REF`; Stage-6 recompiles klayout (buddy ships in `bld`); drop Stage-7
    Python sparse-checkout. Rewire the **6** plugin touchpoints (`phase3_one_shot_runner

@@ -22,7 +22,10 @@ SOURCES = \
   strmcmp.cc \
   strmxor.cc \
   strmrun.cc \
-  strm2mag.cc
+  strm2mag.cc \
+  svrfdrc.cc \
+  $$PWD/../../../plugins/tools/svrf_drc/db_plugin/dbSVRFDeck.cc \
+  $$PWD/../../../plugins/tools/svrf_drc/db_plugin/dbSVRFEngine.cc
 
 HEADERS = \
   bdCommon.h \
@@ -35,6 +38,10 @@ RESOURCES = \
 
 INCLUDEPATH += $$TL_INC $$GSI_INC $$VERSION_INC $$DB_INC $$LIB_INC $$RDB_INC $$PEX_INC $$LYM_INC
 DEPENDPATH += $$TL_INC $$GSI_INC $$VERSION_INC $$DB_INC $$LIB_INC $$RDB_INC $$PEX_INC $$LYM_INC
+
+#  native SVRF/Calibre DRC engine sources (compiled into klayout_bd for the svrfdrc buddy)
+INCLUDEPATH += $$PWD/../../../plugins/tools/svrf_drc/db_plugin
+DEPENDPATH += $$PWD/../../../plugins/tools/svrf_drc/db_plugin
 LIBS += -L$$DESTDIR -lklayout_tl -lklayout_db -lklayout_gsi -lklayout_lib -lklayout_rdb -lklayout_pex -lklayout_lym
 
 INCLUDEPATH += $$RBA_INC
