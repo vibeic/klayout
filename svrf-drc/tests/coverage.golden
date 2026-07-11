@@ -1,0 +1,35 @@
+LAYER metal1 34/0,34/5
+LAYER metal2 36/0
+LAYER metal2b 36/0
+LAYER nact 12/0
+LAYER pact 13/0
+LAYER poly 10/0
+LAYER via 35/0
+CONNECT metal1 metal2 via
+STMT 0 DERIV gate|bool_expr|ops=poly,nact|bool=-|sop=-|val=-|sel=-|metric=-|bounds=-,-|neq=-|edge=0|sup=1
+STMT 1 DERIV allmet|bool|ops=metal1,metal2|bool=||sop=-|val=-|sel=-|metric=-|bounds=-,-|neq=-|edge=0|sup=1
+STMT 2 DERIV p_not_n|bool_expr|ops=poly,nact|bool=-|sop=-|val=-|sel=-|metric=-|bounds=-,-|neq=-|edge=0|sup=1
+STMT 3 DERIV xr|bool_expr|ops=metal1,metal2|bool=-|sop=-|val=-|sel=-|metric=-|bounds=-,-|neq=-|edge=0|sup=1
+STMT 4 DERIV bigger|size|ops=metal1|bool=-|sop=SIZE|val=0.05|sel=-|metric=-|bounds=-,-|neq=-|edge=0|sup=1
+STMT 5 DERIV grown|size|ops=poly|bool=-|sop=GROW|val=0.1|sel=-|metric=-|bounds=-,-|neq=-|edge=0|sup=1
+STMT 6 DERIV shrunk|size|ops=nact|bool=-|sop=SHRINK|val=-0.2|sel=-|metric=-|bounds=-,-|neq=-|edge=0|sup=1
+STMT 7 DERIV sel|select|ops=metal1,metal2|bool=-|sop=-|val=-|sel=INTERACT|metric=-|bounds=-,-|neq=-|edge=0|sup=1
+STMT 8 DERIV seln|select|ops=metal1,metal2|bool=-|sop=-|val=-|sel=OUTSIDE|metric=-|bounds=-,-|neq=-|edge=0|sup=1
+STMT 9 DERIV hol|holes|ops=metal1|bool=-|sop=-|val=-|sel=-|metric=-|bounds=-,-|neq=-|edge=0|sup=1
+STMT 10 DERIV ext|extents|ops=metal2|bool=-|sop=-|val=-|sel=-|metric=-|bounds=-,-|neq=-|edge=0|sup=1
+STMT 11 DERIV big|metric_select|ops=metal1|bool=-|sop=-|val=-|sel=-|metric=AREA|bounds=0.5,-|neq=-|edge=0|sup=1
+STMT 12 DERIV shortp|metric_select|ops=poly|bool=-|sop=-|val=-|sel=-|metric=PERIMETER|bounds=-,2|neq=-|edge=0|sup=1
+STMT 13 DERIV squares|rectangles|ops=metal1|bool=-|sop=-|val=-|sel=-|metric=-|bounds=-,-|neq=-|edge=0|sup=1
+STMT 14 DERIV fewv|vertex|ops=poly|bool=-|sop=-|val=-|sel=-|metric=-|bounds=-,5|neq=-|edge=0|sup=1
+STMT 15 DERIV e1|edge|ops=metal1|bool=-|sop=-|val=-|sel=EDGE|metric=-|bounds=-,-|neq=-|edge=1|sup=1
+STMT 16 DERIV e2|edge|ops=metal1,metal2|bool=-|sop=-|val=-|sel=COINCIDENT|metric=-|bounds=-,-|neq=-|edge=1|sup=1
+STMT 17 DERIV nar|net_ratio|ops=metal1,metal2|bool=-|sop=-|val=-|sel=-|metric=-|bounds=-,-|neq=-|edge=0|sup=1
+STMT 18 RULE SP.M1|EXTERNAL|metal1|-|<|0.14|m=euclidian|ia=90|opp=0|whole=0|conn=none|win=-|step=-|sup=1
+STMT 19 RULE SP.OPP|EXTERNAL|metal1|metal2|<|0.2|m=projection|ia=-|opp=1|whole=0|conn=none|win=-|step=-|sup=1
+STMT 20 RULE W.M1|INTERNAL|metal1|-|<|0.1|m=euclidian|ia=-|opp=0|whole=1|conn=none|win=-|step=-|sup=1
+STMT 21 RULE ENC.CO|ENCLOSURE|via|metal1|<|0.06|m=euclidian|ia=-|opp=0|whole=0|conn=none|win=-|step=-|sup=1
+STMT 22 RULE NOTCH.M1|NOTCH|metal1|-|<|0.12|m=euclidian|ia=-|opp=0|whole=0|conn=none|win=-|step=-|sup=1
+STMT 23 RULE DENS.M1|DENSITY|metal1|-|<|0.3|m=euclidian|ia=-|opp=0|whole=0|conn=none|win=100|step=50|sup=1
+STMT 24 RULE ANT.M1|ANTENNA|metal1|-|>|400|m=euclidian|ia=-|opp=0|whole=0|conn=none|win=-|step=-|sup=0
+STMT 25 RULE NET.SP|EXTERNAL|metal1|metal2|<|0.3|m=euclidian|ia=-|opp=0|whole=0|conn=different|win=-|step=-|sup=1
+STMT 26 RULE REPORT.SP|COPY|SP.M1|-||0|m=euclidian|ia=-|opp=0|whole=0|conn=none|win=-|step=-|sup=1

@@ -1,0 +1,78 @@
+// coverage.rule — SYNTHETIC deck exercising every parser branch (NO vendor data).
+// Not geometrically meaningful; used only to cross-check the native C++ parser
+// (dbSVRFDeck) against the reference Python parser (svrf_parse.py).
+
+// --- two-level Calibre LAYER + MAP form (bare number is an INDEX, not a GDS layer) ---
+LAYER metal1 100
+LAYER MAP 34 DATATYPE 0 100
+LAYER MAP 34 DATATYPE 5 100
+LAYER metal2 101
+LAYER MAP 36 DATATYPE 0 101
+// --- direct form ---
+LAYER poly 10 0
+LAYER nact 12 0
+LAYER pact 13 0
+LAYER via  35 0
+
+// --- preprocessor: only the TOPMETAL_2 branch is active ---
+#DEFINE TOPMETAL_2
+#IFDEF TOPMETAL_3
+LAYER metal3 40 0
+#ELSE
+LAYER metal2b 36 0
+#ENDIF
+
+// --- connectivity stack ---
+CONNECT metal1 metal2 BY via
+
+// --- derivations: boolean prefix (Calibre), infix, size, select(+negate), unary,
+//     metric_select, rectangles, vertex, edge, net-area-ratio ---
+gate = poly AND nact
+allmet = OR metal1 metal2
+p_not_n = poly NOT nact
+xr = metal1 XOR metal2
+bigger = metal1 SIZE 0.05
+grown = poly GROW 0.1
+shrunk = nact SHRINK 0.2
+sel = metal1 INTERACT metal2
+seln = metal1 NOT OUTSIDE metal2
+hol = metal1 HOLES
+ext = metal2 EXTENTS
+big = metal1 AREA > 0.5
+shortp = poly PERIMETER < 2.0
+squares = metal1 RECTANGLE ASPECT < 2
+fewv = poly VERTEX < 5
+e1 = metal1 EDGE
+e2 = metal1 COINCIDENT INSIDE EDGE metal2
+nar = metal1 NET AREA RATIO metal2 == 0
+
+// --- measurement rules with modifiers ---
+SP.M1 {
+  EXTERNAL metal1 < 0.14 ABUT < 90 REGION
+}
+SP.OPP {
+  EXTERNAL metal1 metal2 < 0.20 OPPOSITE PROJECTING REGION
+}
+W.M1 {
+  INTERNAL metal1 < 0.10 WHOLE REGION
+}
+ENC.CO {
+  ENCLOSURE via metal1 < 0.06 REGION
+}
+NOTCH.M1 {
+  NOTCH metal1 < 0.12 REGION
+}
+DENS.M1 {
+  DENSITY metal1 < 0.30 WINDOW 100 STEP 50
+}
+ANT.M1 {
+  ANTENNA metal1 > 400
+}
+NET.SP {
+  EXTERNAL metal1 metal2 < 0.30 NOT CONNECTED REGION
+}
+
+// --- COPY: report a previously-computed error layer (foundry rule-naming idiom) ---
+REPORT.SP {
+  COPY SP.M1
+}

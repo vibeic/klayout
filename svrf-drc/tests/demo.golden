@@ -1,0 +1,11 @@
+LAYER metal1 34/0
+LAYER metal2 36/0
+LAYER nact 12/0
+LAYER poly 10/0
+STMT 0 DERIV gate|bool_expr|ops=poly,nact|bool=-|sop=-|val=-|sel=-|metric=-|bounds=-,-|neq=-|edge=0|sup=1
+STMT 1 RULE SPACE.M1.FAIL|EXTERNAL|metal1|-|<|0.14|m=euclidian|ia=90|opp=0|whole=0|conn=none|win=-|step=-|sup=1
+STMT 2 RULE SPACE.M1.PASS|EXTERNAL|metal1|-|<|0.08|m=euclidian|ia=90|opp=0|whole=0|conn=none|win=-|step=-|sup=1
+STMT 3 RULE WIDTH.M1.PASS|INTERNAL|metal1|-|<|0.5|m=euclidian|ia=90|opp=0|whole=0|conn=none|win=-|step=-|sup=1
+STMT 4 RULE AREA.M2.FAIL|AREA|metal2|-|<|0.05|m=euclidian|ia=-|opp=0|whole=0|conn=none|win=-|step=-|sup=1
+STMT 5 RULE GATE.W.PASS|INTERNAL|gate|-|<|0.05|m=euclidian|ia=90|opp=0|whole=0|conn=none|win=-|step=-|sup=1
+STMT 6 RULE SPACE.M1M2.NET|EXTERNAL|metal1|metal2|<|0.3|m=euclidian|ia=-|opp=0|whole=0|conn=different|win=-|step=-|sup=1

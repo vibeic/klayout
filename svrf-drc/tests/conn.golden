@@ -1,0 +1,6 @@
+LAYER metal1 34/0
+LAYER metal2 36/0
+LAYER via 35/0
+CONNECT metal1 metal2 via
+STMT 0 RULE NOTCON.M1M2|EXTERNAL|metal1|metal2|<|0.3|m=euclidian|ia=-|opp=0|whole=0|conn=different|win=-|step=-|sup=1
+STMT 1 RULE CONN.M1M2|EXTERNAL|metal1|metal2|<|0.3|m=euclidian|ia=-|opp=0|whole=0|conn=same|win=-|step=-|sup=1
