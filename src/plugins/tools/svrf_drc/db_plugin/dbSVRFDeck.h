@@ -29,7 +29,10 @@ namespace db
 //    none      -- no net awareness
 //    same      -- CONNECTED     (same net)
 //    different -- NOT CONNECTED (different nets)
-enum class Connectivity { none, same, different };
+//  NOTE: named SVRFConnectivity (not Connectivity) to avoid colliding with the
+//  existing db::Connectivity class (dbHierNetworkProcessor.h) once this header is
+//  compiled inside the KLayout db tree.
+enum class SVRFConnectivity { none, same, different };
 
 //  A geometric measurement (rule). Modifiers are carried as native-check
 //  parameters (metrics / ignore_angle / opposite / projection / connectivity)
@@ -56,7 +59,7 @@ struct SVRFRule
   bool shielded = false;
   bool region_out = false;               // REGION -> output polygons
   bool singular = false;
-  Connectivity connectivity = Connectivity::none;
+  SVRFConnectivity connectivity = SVRFConnectivity::none;
   bool has_window = false;
   double window = 0.0;                    // DENSITY WINDOW w (um)
   bool has_step = false;
@@ -102,7 +105,11 @@ struct SVRFDerivation
 struct SVRFStatement
 {
   enum Kind { Rule, Derivation } kind;
-  size_t index = 0;                      // index into SVRFDeck::rules or ::derivations
+  size_t index;                          // index into SVRFDeck::rules or ::derivations
+  //  explicit ctors: the default-member-initializer form disqualifies aggregate
+  //  init under -std=c++11 (the KLayout build standard), so provide constructors.
+  SVRFStatement () : kind (Rule), index (0) { }
+  SVRFStatement (Kind k, size_t i) : kind (k), index (i) { }
 };
 
 struct SVRFDeck

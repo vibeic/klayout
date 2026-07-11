@@ -1,0 +1,15 @@
+# SVRF-native DRC via KLayout KLayout 0.30.9
+# deck=/work/coverage.rule  layout=/work/synth.gds  dbu=0.001
+# 7 layers, 18 derivations, 9 rules  |  {'FAIL': 4, 'PASS': 4, 'SKIP': 1}
+
+FAIL  SP.M1              EXTERNAL metal1 < 0.14 [metrics=euclidian,ignore_angle=90.0] -> 1
+PASS  SP.OPP             EXTERNAL metal1/metal2 < 0.2 [metrics=projection,opposite] -> 0
+FAIL  W.M1               INTERNAL metal1 < 0.1 [metrics=euclidian,whole] -> 3
+PASS  ENC.CO             ENCLOSURE via/metal1 < 0.06 [metrics=euclidian] -> 0
+PASS  NOTCH.M1           NOTCH metal1 < 0.12 [metrics=euclidian] -> 0
+FAIL  DENS.M1            DENSITY metal1 < 0.3 [metrics=euclidian] -> 1
+SKIP  ANT.M1             ANTENNA metal1 > 400.0 [metrics=euclidian] -> ANTENNA (charge ratio) routed to antenna checker, not geometric core
+PASS  NET.SP             EXTERNAL metal1/metal2 < 0.3 [metrics=euclidian] -> 0
+FAIL  REPORT.SP          COPY SP.M1  0.0 [COPY] -> 1
+
+# tally: {'FAIL': 4, 'PASS': 4, 'SKIP': 1}

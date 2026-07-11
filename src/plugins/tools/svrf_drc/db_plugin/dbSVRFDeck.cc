@@ -407,9 +407,9 @@ static void parse_modifiers (SVRFRule &rule, const std::string &tail)
     rule.singular = true;
   }
   if (std::regex_search (tail, re_notconn)) {
-    rule.connectivity = Connectivity::different;
+    rule.connectivity = SVRFConnectivity::different;
   } else if (std::regex_search (tail, re_conn)) {
-    rule.connectivity = Connectivity::same;
+    rule.connectivity = SVRFConnectivity::same;
   }
 }
 

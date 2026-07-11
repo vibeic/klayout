@@ -58,7 +58,31 @@ buddy binary only.
    `db::Region::{space,separation,width,overlap,notch,enclosing}_check` (+
    `RegionCheckOptions`), `db::Edges`, `db::LayoutToNetlist` (CONNECT / NET AREA
    RATIO), windowed DENSITY, boolean/size/select/metric/rectangle/vertex derivations.
-   Emits the frozen report format. Needs the KLayout build to compile.
+   Emits the frozen report format. Needs the KLayout build to compile. **[DONE]**
+   - `db_plugin/dbSVRFEngine.{h,cc}` — full port. pya→raw db:: mapping: convenience
+     methods (`with_area`/`rectangles`/`interacting`/`extents`/edge `with_length`/…)
+     rebuilt via `db::Region::filtered(db::RegionAreaFilter/RectangleFilter/
+     RegionBBoxFilter/RegionRatioFilter)`, `selected_interacting/inside/outside`,
+     `processed(extents_processor)`, `db::Edges::filtered(EdgeLengthFilter/
+     EdgeOrientationFilter)`, `extended(out,…)`. Connectivity via the REAL
+     `db::Region::nets(l2n, NPM_NetQualifiedNameOnly, "net")` + `SamePropertiesConstraint`
+     / `DifferentPropertiesConstraint`. Report float/dict formatting reproduces Python
+     `str(float)` (`std::to_chars` + re-added `.0`) and `dict(Counter)` (first-appearance
+     order) EXACTLY.
+   - **Name clash fix:** the parser enum `Connectivity` was renamed `SVRFConnectivity`
+     (KLayout's `db` namespace already has a `class Connectivity`); the parser dump
+     goldens (demo/conn/coverage) still pass unchanged.
+   - **Byte-parity PROVEN, two synthetic corpora, C++ ≡ Python `run_svrf_drc.py`**
+     (identical KLayout 0.30.9 both sides): `tests/run_engine_parity.sh` builds
+     `engine_smoke`, generates the fixtures + Python golden in the vibeic-eda container,
+     runs the native engine, and diffs. corpus-1 (`coverage.rule`) exercises every
+     dispatch branch (4 FAIL: space/width/density/COPY, 4 PASS, 1 ANTENNA SKIP); corpus-2
+     (`coverage2.rule`) forces separation/enclosure/notch/width/boolean-COPY to non-zero
+     (5 FAIL). Both **byte-identical**. Fixtures: `examples/coverage2.rule`,
+     `tests/gen_synth{,2}_gds.py`, `tests/engine_coverage{,2}.golden`, `tests/engine_smoke.cc`.
+   - **Side-finding:** the vibeic-eda:0.2.10 image ships a STALE `svrf_parse.py` (416 lines
+     vs the fork's current 522) — moot, since increment 4 re-bakes the image to the native
+     C++ binary and drops the Python entirely.
 3. **buddy `svrfdrc`** — `src/buddies/src/bd/svrfdrc.cc` (mirror `strmxor.cc`), add to
    `bd.pro` SOURCES + `src/buddies/src/svrfdrc/svrfdrc.pro` + `src.pro`.
 4. **container re-bake + plugin rewire + delete Python** — bump vibeic-eda

@@ -1,0 +1,11 @@
+# SVRF-native DRC via KLayout KLayout 0.30.9
+# deck=/work/coverage2.rule  layout=/work/synth2.gds  dbu=0.001
+# 4 layers, 1 derivations, 5 rules  |  {'FAIL': 5}
+
+FAIL  SEP12              EXTERNAL m1/m2 < 0.5 [metrics=euclidian] -> 1
+FAIL  ENCV               ENCLOSURE via/m1 < 0.2 [metrics=euclidian] -> 2
+FAIL  NOTCH1             NOTCH m1 < 0.3 [metrics=euclidian] -> 1
+FAIL  WID1               INTERNAL m1 < 0.1 [metrics=euclidian] -> 1
+FAIL  RPTBAND            COPY band  0.0 [COPY] -> 1
+
+# tally: {'FAIL': 5}

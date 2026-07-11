@@ -1,0 +1,29 @@
+// coverage2.rule -- SYNTHETIC second corpus. Forces separation / enclosure /
+// notch / edge-length / boolean-COPY to produce NON-ZERO counts, so byte-parity
+// is proven under load (not just at 0). NO vendor data.
+
+LAYER m1  20 0
+LAYER m2  21 0
+LAYER via 22 0
+LAYER poly 23 0
+
+CONNECT m1 m2 BY via
+
+// boolean derivation -> reported via COPY (fires when poly overlaps m1)
+band = poly AND m1
+
+SEP12 {
+  EXTERNAL m1 m2 < 0.50 REGION
+}
+ENCV {
+  ENCLOSURE via m1 < 0.20 REGION
+}
+NOTCH1 {
+  NOTCH m1 < 0.30 REGION
+}
+WID1 {
+  INTERNAL m1 < 0.10 REGION
+}
+RPTBAND {
+  COPY band
+}

@@ -44,11 +44,11 @@ static std::string dash (const std::string &s)
   return s.empty () ? std::string ("-") : s;
 }
 
-static std::string conn_str (db::Connectivity c)
+static std::string conn_str (db::SVRFConnectivity c)
 {
   switch (c) {
-    case db::Connectivity::same: return "same";
-    case db::Connectivity::different: return "different";
+    case db::SVRFConnectivity::same: return "same";
+    case db::SVRFConnectivity::different: return "different";
     default: return "none";
   }
 }
