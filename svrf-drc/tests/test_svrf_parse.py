@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from svrf_klayout.svrf_parse import parse_deck, parse_layers  # noqa: E402
+from svrf_klayout.svrf_parse import parse_deck, parse_layers, preprocess  # noqa: E402
 
 DECK = """
 // synthetic SVRF-format deck (no vendor data)
@@ -185,3 +185,40 @@ def test_negated_select():
     assert d2.select_op == "INTERACT" and d2.params["negate"] is True
     # un-negated select stays un-negated
     assert _der("a INSIDE b").params["negate"] is False
+
+
+def test_preprocess_ifdef_metal_stack_switches():
+    # A real foundry deck selects its metal stack via #DEFINE/#IFDEF. Without
+    # resolving them, thick-metal rules for UNUSED configs expand and misfire
+    # (commercial-PDK: thousands of spurious TVt*.EN thick-via violations on a thin
+    # 4-metal route). preprocess() must include only the selected branches.
+    t = (
+        "#DEFINE TOPMETAL_5\n"
+        "#IFDEF TOPMETAL_5\nLAYER m5top 15 0\n#ENDIF\n"
+        "#IFDEF TOPMETAL_6\nLAYER m6top 17 0\n#ENDIF\n"
+        "#IFNDEF CUSTOM\n#DEFINE MIM_23\n#ENDIF\n"
+        "#IFDEF MIM_23\nLAYER mim 40 0\n#ENDIF\n"
+        "#IFDEF MIM_45\nLAYER mim45 42 0\n#ENDIF\n")
+    out = preprocess(t)
+    assert "m5top" in out            # TOPMETAL_5 selected
+    assert "m6top" not in out        # TOPMETAL_6 not selected
+    assert "mim " in out or "mim\n" in out   # MIM_23 set via nested #IFNDEF
+    assert "mim45" not in out        # MIM_45 never defined
+
+
+def test_preprocess_else_and_nested():
+    t = ("#IFDEF A\nLAYER a 1 0\n#ELSE\nLAYER notA 2 0\n#ENDIF\n"
+         "#DEFINE B\n#IFDEF B\n#IFDEF A\nLAYER ab 3 0\n#ELSE\nLAYER bNotA 4 0\n"
+         "#ENDIF\n#ENDIF\n")
+    out = preprocess(t)
+    assert "notA" in out and "LAYER a " not in out   # A undefined -> ELSE branch
+    assert "bNotA" in out and "LAYER ab " not in out  # B set, A unset -> inner ELSE
+
+
+def test_preprocess_commented_define_is_inert():
+    # strip_comments runs BEFORE preprocess, so a //#DEFINE is already gone —
+    # here we assert preprocess itself does not resurrect a raw commented form.
+    from svrf_klayout.svrf_parse import strip_comments
+    t = "//#DEFINE X\n#IFDEF X\nLAYER x 1 0\n#ENDIF\n"
+    out = preprocess(strip_comments(t))
+    assert "LAYER x" not in out      # X was only in a comment -> branch excluded

@@ -63,6 +63,70 @@ def strip_comments(text: str) -> str:
     return _LINE_COMMENT.sub('', _BLOCK_COMMENT.sub('', text))
 
 
+_PP_RE = re.compile(
+    r'^\s*#\s*(DEFINE|UNDEF|IFDEF|IFNDEF|ELSE|ELIF|ENDIF)\b(.*)$',
+    re.IGNORECASE)
+
+
+def preprocess(text: str) -> str:
+    """Resolve the SVRF/Calibre C-style preprocessor
+    (#DEFINE / #UNDEF / #IFDEF / #IFNDEF / #ELSE / #ELIF / #ENDIF).
+
+    A real production foundry DRC deck selects its metal stack, MIM option, top
+    metal, and thick-IMD count through preprocessor switches
+    (`#DEFINE TOPMETAL_5`, `#IFDEF MIM_23`, ...). Without resolving them EVERY
+    conditional branch expands at once, so thick-metal/via rules fire on layer
+    configurations the design never used (a commercial foundry commercial-PDK: a thin 4-metal
+    digital route produced thousands of spurious `TVt*.EN` thick-via-enclosure
+    violations). Flag-based conditional inclusion (no text substitution): a
+    `#DEFINE` inside an active branch registers a symbol that later `#IFDEF`s
+    see; nested conditionals are supported. Run AFTER strip_comments so a
+    commented-out `//#DEFINE` is not treated as an active directive."""
+    defines: set = set()
+    stack: list = []          # each frame: [active_here, any_branch_taken]
+
+    def _parent_active() -> bool:
+        return all(f[0] for f in stack)
+
+    out: list = []
+    for line in text.splitlines():
+        m = _PP_RE.match(line)
+        if m:
+            drv = m.group(1).upper()
+            arg = m.group(2).split()
+            sym = arg[0] if arg else ""
+            if drv == "IFDEF":
+                cond = _parent_active() and (sym in defines)
+                stack.append([cond, cond])
+            elif drv == "IFNDEF":
+                cond = _parent_active() and (sym not in defines)
+                stack.append([cond, cond])
+            elif drv == "ELIF":
+                if stack:
+                    taken = stack[-1][1]
+                    parent = all(f[0] for f in stack[:-1])
+                    cond = parent and (not taken) and (sym in defines)
+                    stack[-1] = [cond, taken or cond]
+            elif drv == "ELSE":
+                if stack:
+                    taken = stack[-1][1]
+                    parent = all(f[0] for f in stack[:-1])
+                    stack[-1] = [parent and (not taken), True]
+            elif drv == "ENDIF":
+                if stack:
+                    stack.pop()
+            elif drv == "DEFINE":
+                if _parent_active() and sym:
+                    defines.add(sym)
+            elif drv == "UNDEF":
+                if _parent_active() and sym:
+                    defines.discard(sym)
+            continue                      # the directive line is consumed
+        if _parent_active():
+            out.append(line)
+    return "\n".join(out)
+
+
 def parse_layers(text: str) -> dict[str, list[tuple[int, int]]]:
     """Resolve each layer NAME to the list of GDS (layer, datatype) purposes it
     draws from. Two Calibre idioms, both supported:
@@ -406,6 +470,7 @@ def parse_deck(text: str) -> Deck:
     `NAME { OP ... }` / `NAME { COPY errlayer }` and from `name = OP ...`
     assignments; derivations from `name = <layer expression>` assignments."""
     text = strip_comments(text)
+    text = preprocess(text)          # resolve #DEFINE/#IFDEF metal-stack switches
     layers = parse_layers(text)
     connects = [(m.group(1), m.group(2), m.group(3)) for m in _CONNECT_RE.finditer(text)]
     derivations: list[Derivation] = []
