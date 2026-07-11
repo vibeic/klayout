@@ -461,30 +461,41 @@ db::Edges SVRFEngine::build_edges (const SVRFDerivation &d)
     db::Edges e = as_edges (d.operands[0]);
     bool has_lo = d.has_lo, has_hi = d.has_hi;
     double lo = d.lo, hi = d.hi;
+    //  SVRF metric negation + bound strictness (compiler folds `NOT ANGLE
+    //  X >0 <90` into negate=1 + strict bounds). Ignoring either turned
+    //  that construct into the strictly-inside-(0,90) selection — the EMPTY
+    //  set on a rectilinear layout (commercial-PDK a contact-orientation rule collapse).
+    bool negate = pflag (d.params, "negate");
+    bool lo_strict = pflag (d.params, "lo_strict");
+    bool hi_strict = pflag (d.params, "hi_strict");
     if (d.metric == "LENGTH") {
       if (d.has_neq) {
-        db::EdgeLengthFilter f (to_dbu (d.neq), to_dbu (d.neq), true);
+        db::EdgeLengthFilter f (to_dbu (d.neq), to_dbu (d.neq), !negate);
         return e.filtered (f);
       }
       if (has_lo && has_hi && lo == hi) {
-        db::EdgeLengthFilter f (to_dbu (lo), to_dbu (lo), false);
+        db::EdgeLengthFilter f (to_dbu (lo), to_dbu (lo), negate);
         return e.filtered (f);
       }
       db::EdgeLengthFilter::length_type lmin = has_lo ? (db::EdgeLengthFilter::length_type) to_dbu (lo) : 0;
       db::EdgeLengthFilter::length_type lmax = has_hi ? (db::EdgeLengthFilter::length_type) to_dbu (hi) : std::numeric_limits<db::EdgeLengthFilter::length_type>::max ();
-      db::EdgeLengthFilter f (lmin, lmax, false);
+      if (has_lo && lo_strict) { lmin += 1; }
+      if (has_hi && hi_strict && lmax > 0) { /* lmax is exclusive already */ }
+      db::EdgeLengthFilter f (lmin, lmax, negate);
       return e.filtered (f);
     }
     //  ANGLE (degrees, undirected 0..180) -> absolute orientation filter
     if (d.has_neq) {
-      db::EdgeOrientationFilter f (d.neq, true /*inverse*/, true /*absolute*/);
+      db::EdgeOrientationFilter f (d.neq, !negate /*inverse*/, true /*absolute*/);
       return e.filtered (f);
     }
     if (has_lo && has_hi && lo == hi) {
-      db::EdgeOrientationFilter f (lo, false, true);
+      db::EdgeOrientationFilter f (lo, negate, true);
       return e.filtered (f);
     }
-    db::EdgeOrientationFilter f (has_lo ? lo : 0.0, true, has_hi ? hi : 90.0, true, false, true);
+    db::EdgeOrientationFilter f (has_lo ? lo : 0.0, !(has_lo && lo_strict),
+                                 has_hi ? hi : 90.0, !(has_hi && hi_strict),
+                                 negate, true);
     return e.filtered (f);
   }
 
@@ -528,6 +539,13 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d)
   if (! d.supported) {
     m_unmodeled.insert (d.name);
     m_regions[d.name] = db::Region ();
+    //  SVRFDRC_DEBUG=1: name every unsupported derivation + the parser's
+    //  reason on stderr — the only way to see WHY a chain collapsed without
+    //  bisecting probe decks (this diagnosis cost hours blind).
+    if (getenv ("SVRFDRC_DEBUG")) {
+      fprintf (stderr, "svrfdrc: UNMODELED %s (%s) expr=%s\n",
+               d.name.c_str (), d.reason.c_str (), d.expr.c_str ());
+    }
     return;
   }
   if (d.edge_typed) {
@@ -561,7 +579,38 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d)
       }
       m_regions[d.name] = acc;
     } else if (k == "size") {
-      m_regions[d.name] = resolve (d.operands[0]).sized (to_dbu (d.has_value ? d.value : 0.0));
+      auto it_dir = d.params.find ("dir");
+      if (it_dir != d.params.end ()) {
+        //  One-sided size (SHRINK/GROW <layer> RIGHT|LEFT|TOP|BOTTOM BY w):
+        //  exactly erosion/dilation by an off-center axis-aligned segment =
+        //  half-size on that axis + a translation that pins the far side.
+        //  With signed v (negative for SHRINK), h = v/2, t = v - h:
+        //    RIGHT: sized(h,0) then move(+t,0)   LEFT:   ... move(-t,0)
+        //    TOP:   sized(0,h) then move(0,+t)   BOTTOM: ... move(0,-t)
+        //  (worked example, SHRINK RIGHT BY 5: [x0,x1] -> sized -2.5 ->
+        //   [x0+2.5, x1-2.5] -> move -2.5 -> [x0, x1-5]; far side pinned.)
+        //  Sequential R,L,T,B one-sided shrinks compose to the isotropic
+        //  size — Calibre's wide-metal derivation idiom relies on this;
+        //  treating the qualifier as isotropic corrupted every
+        //  wide-metal chains chain (commercial-PDK a metal1-spacing rule/a wide-metal spacing rule phantoms).
+        db::Coord v = to_dbu (d.has_value ? d.value : 0.0);   // signed
+        db::Coord h = v / 2;
+        db::Coord t = v - h;                                   // dbu-exact split
+        const std::string &dir = it_dir->second;
+        db::Region r = resolve (d.operands[0]);
+        if (dir == "RIGHT") {
+          r = r.sized (h, 0); r.transform (db::Disp (db::Vector (t, 0)));
+        } else if (dir == "LEFT") {
+          r = r.sized (h, 0); r.transform (db::Disp (db::Vector (-t, 0)));
+        } else if (dir == "TOP") {
+          r = r.sized (0, h); r.transform (db::Disp (db::Vector (0, t)));
+        } else {  // BOTTOM
+          r = r.sized (0, h); r.transform (db::Disp (db::Vector (0, -t)));
+        }
+        m_regions[d.name] = r;
+      } else {
+        m_regions[d.name] = resolve (d.operands[0]).sized (to_dbu (d.has_value ? d.value : 0.0));
+      }
     } else if (k == "select") {
       db::Region a = resolve (d.operands[0]);
       db::Region b = d.operands.size () > 1 ? resolve (d.operands[1]) : db::Region ();
@@ -574,8 +623,35 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d)
       } else if (op == "OUTSIDE") {
         res = negate ? a.selected_not_outside (b) : a.selected_outside (b);
       } else {
-        //  INTERACT / CUT / TOUCH / ENCLOSE all map to interacting in the reference
-        res = negate ? a.selected_not_interacting (b) : a.selected_interacting (b);
+        //  INTERACT / CUT / TOUCH / ENCLOSE all map to interacting in the reference.
+        //  SVRF interaction-count qualifier (INTERACT A B ==N / >N / <N): fold
+        //  the compiler's count params into KLayout's counted overload; strict
+        //  integral bounds shift by one (>N -> min N+1, <N -> max N-1).
+        size_t cmin = 1;
+        size_t cmax = std::numeric_limits<size_t>::max ();
+        auto it_lo = d.params.find ("count_lo");
+        auto it_hi = d.params.find ("count_hi");
+        if (it_lo != d.params.end ()) {
+          cmin = (size_t) std::strtoull (it_lo->second.c_str (), 0, 10);
+          if (pflag (d.params, "count_lo_strict")) { cmin += 1; }
+        }
+        if (it_hi != d.params.end ()) {
+          cmax = (size_t) std::strtoull (it_hi->second.c_str (), 0, 10);
+          if (pflag (d.params, "count_hi_strict") && cmax > 0) { cmax -= 1; }
+        }
+        if (cmin != 1 || cmax != std::numeric_limits<size_t>::max ()) {
+          //  Calibre counts the OTHER layer's ORIGINAL polygons; KLayout's
+          //  merged semantics unions corner-touching polygons first (the 4
+          //  EXPAND-EDGE strips of a square become ONE ring -> count 1 and
+          //  ==4 never matches). Count against the raw polygons.
+          db::Region braw (b);
+          braw.set_merged_semantics (false);
+          res = negate ? a.selected_not_interacting (braw, cmin, cmax)
+                       : a.selected_interacting (braw, cmin, cmax);
+        } else {
+          res = negate ? a.selected_not_interacting (b, cmin, cmax)
+                       : a.selected_interacting (b, cmin, cmax);
+        }
       }
       m_regions[d.name] = res;
     } else if (k == "passthrough") {
@@ -586,6 +662,11 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d)
       m_regions[d.name] = resolve (d.operands[0]).holes ();
     } else if (k == "rectangles") {
       m_regions[d.name] = rectangles_of (d);
+    } else if (k == "layout_extent") {
+      //  nullary EXTENT = the LAYOUT extent (bbox of the top cell over all
+      //  layers). Distinct from the per-shape EXTENTS op below. commercial-PDK's
+      //  SUB=EXTENT seeds the whole BULK/LV context tree from this.
+      m_regions[d.name] = db::Region (m_layout.cell (m_top).bbox ());
     } else if (k == "extents") {
       m_regions[d.name] = resolve (d.operands[0]).processed (db::extents_processor<db::Polygon> (0, 0));
     } else if (k == "merge") {
@@ -597,7 +678,12 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d)
       db::Region b = d.operands.size () > 1 ? resolve (d.operands[1]) : db::Region ();
       m_regions[d.name] = a.selected_interacting (b.edges ());
     } else if (k == "expand") {
-      db::Edges edges = resolve (d.operands[0]).edges ();
+      //  the operand may be an EDGE-typed derivation (e.g. an ANGLE
+      //  selection): resolve() only consults the REGION table, so an edge
+      //  operand silently became empty and every EXPAND EDGE chain
+      //  collapsed (commercial-PDK a contact-orientation rule). as_edges() consults the edge table
+      //  first and falls back to region.edges().
+      db::Edges edges = as_edges (d.operands[0]);
       db::Coord w = to_dbu (std::fabs (d.has_value ? d.value : 0.0));
       db::Region ex;
       if (pflag (d.params, "inside")) {

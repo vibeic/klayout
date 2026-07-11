@@ -88,10 +88,12 @@ static int count_char (const std::string &s, char c)
 
 // ── shared token classifiers ────────────────────────────────────────────────
 
-//  fullmatch [A-Za-z_][\w.$]*
+//  fullmatch [A-Za-z_][\w.$:]* — the ":" admits SVRF temp names
+//  (name:tmp); without it `X:tmp = ...` parses as an assignment to X and
+//  silently OVERWRITES the base layer (commercial-PDK wide-metal chains chains).
 static const std::regex &ident_re ()
 {
-  static const std::regex re ("[A-Za-z_][\\w.$]*", std::regex::ECMAScript);
+  static const std::regex re ("[A-Za-z_][\\w.$:]*", std::regex::ECMAScript);
   return re;
 }
 
@@ -685,6 +687,14 @@ static SVRFDerivation parse_derivation (const std::string &name, const std::stri
       if ((t == "SHRINK" || t == "UNDERSIZE") && d.has_value) {
         d.value = -std::abs (d.value);
       }
+      //  one-sided qualifier (SHRINK X RIGHT BY 5 ...). Treating it as an
+      //  isotropic size silently corrupts every wide-metal derivation
+      //  (commercial-PDK wide-metal chains chains) — the exact one-sided form is
+      //  a half-size on that axis plus a half translation (erosion/dilation
+      //  by an off-center segment), applied in the engine.
+      for (const char *dir : {"RIGHT", "LEFT", "TOP", "BOTTOM"}) {
+        if (has (dir)) { d.params["dir"] = dir; break; }
+      }
       if (d.operands.empty ()) {
         d.supported = false; d.reason = "size without a layer";
       }
@@ -818,6 +828,36 @@ static SVRFDerivation parse_derivation (const std::string &name, const std::stri
       d.select_op = t;
       for (size_t i = 0; i < lt.size () && i < 2; ++i) { d.operands.push_back (lt[i]); }
       d.params["negate"] = has ("NOT") ? "1" : "0";
+      //  SVRF interaction-count qualifier: `INTERACT A B ==N / >N / <N`.
+      //  Dropping the count made every counted INTERACT behave uncounted —
+      //  commercial-PDK a contact-orientation rule selects contacts interacting with EXACTLY 4
+      //  rectilinear-edge strips, so the uncounted form mislabels every
+      //  square contact in the design (15632/15632 false-flagged). Strict
+      //  bounds fold to the integral count in the engine (>N -> N+1,
+      //  <N -> N-1).
+      {
+        bool clo = false, chi = false; double cl = 0.0, ch = 0.0;
+        rel_bounds (expr, clo, cl, chi, ch);
+        if (clo || chi) {
+          bool lo_strict = false, hi_strict = false;
+          static const std::regex re_rel (
+            R"((<=|<|>=|>|==)\s*(-?[0-9]*\.?[0-9]+))", std::regex::ECMAScript);
+          for (auto it = std::sregex_iterator (expr.begin (), expr.end (), re_rel);
+               it != std::sregex_iterator (); ++it) {
+            const std::string rel = (*it)[1].str ();
+            if (rel == ">") lo_strict = true;
+            else if (rel == "<") hi_strict = true;
+          }
+          if (clo) {
+            d.params["count_lo"] = std::to_string ((long long) cl);
+            d.params["count_lo_strict"] = lo_strict ? "1" : "0";
+          }
+          if (chi) {
+            d.params["count_hi"] = std::to_string ((long long) ch);
+            d.params["count_hi_strict"] = hi_strict ? "1" : "0";
+          }
+        }
+      }
       if (lt.empty ()) {
         d.supported = false; d.reason = "select without a layer";
       }
@@ -834,11 +874,41 @@ static SVRFDerivation parse_derivation (const std::string &name, const std::stri
       rel_bounds (expr, d.has_lo, d.lo, d.has_hi, d.hi);
       d.has_neq = find_neq (expr, d.neq);
       d.edge_typed = (t == "LENGTH" || t == "ANGLE");
+      //  SVRF metric negation + bound strictness. `NOT ANGLE X >0 <90` is
+      //  ONE construct: edges NOT strictly inside (0,90). Ignoring the NOT
+      //  (and the strictness) turned it into "edges strictly inside (0,90)"
+      //  — for a rectilinear layout that is the EMPTY set, so every
+      //  derivation chained on it silently collapsed (commercial-PDK a contact-orientation rule).
+      d.params["negate"] = has ("NOT") ? "1" : "0";
+      {
+        bool lo_strict = false, hi_strict = false;
+        static const std::regex re_rel (
+          R"((<=|<|>=|>|==)\s*(-?[0-9]*\.?[0-9]+))", std::regex::ECMAScript);
+        for (auto it = std::sregex_iterator (expr.begin (), expr.end (), re_rel);
+             it != std::sregex_iterator (); ++it) {
+          const std::string rel = (*it)[1].str ();
+          if (rel == ">") lo_strict = true;
+          else if (rel == "<") hi_strict = true;
+        }
+        d.params["lo_strict"] = lo_strict ? "1" : "0";
+        d.params["hi_strict"] = hi_strict ? "1" : "0";
+      }
       if (d.operands.empty () || (!d.has_lo && !d.has_hi && !d.has_neq)) {
         d.supported = false; d.reason = t + " select without layer/bounds";
       }
       return d;
     }
+  }
+
+  //  nullary EXTENT: SVRF `X=EXTENT` (no operand) is the LAYOUT extent —
+  //  the bbox of everything — NOT the per-shape EXTENTS op. Must precede
+  //  the bare-identifier passthrough: `EXTENT` alone used to resolve as an
+  //  undefined layer named EXTENT -> silently empty -> every BULK/LV
+  //  context derived from it collapsed (commercial-PDK: SUB=EXTENT empty made
+  //  POhv.S.5 fire 15420x on plain LV std cells).
+  if (up.size () == 1 && (up[0] == "EXTENT" || up[0] == "EXTENTS")) {
+    d.kind = "layout_extent";
+    return d;
   }
 
   //  bare alias / passthrough
@@ -859,7 +929,7 @@ SVRFDeck parse_deck (const std::string &text)
   static const std::regex block_open (
     R"(^\s*([A-Za-z0-9_.\-/]+)\s*\{\s*$)", std::regex::ECMAScript);
   static const std::regex assign_head (
-    R"(^\s*([A-Za-z_][\w.$]*)\s*=\s*(.+)$)", std::regex::ECMAScript);
+    R"(^\s*([A-Za-z_][\w.$:]*)\s*=\s*(.+)$)", std::regex::ECMAScript);
   static const std::regex layer_re (
     R"(^\s*LAYER\s+([A-Za-z_][\w.$]*)\s+(\d+)(?:\s+(\d+))?\s*$)",
     std::regex::ECMAScript | std::regex::icase);
