@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
 #
 # run_engine_parity.sh -- prove the NATIVE C++ engine (db::SVRFEngine) is
-# byte-for-byte identical to the reference Python interpreter (run_svrf_drc.py)
-# on SYNTHETIC decks + layouts. NO vendor data anywhere in this test.
+# byte-for-byte identical to the FROZEN reference goldens on SYNTHETIC decks +
+# layouts. NO vendor data anywhere in this test.
+#
+# The goldens (tests/engine_<name>.golden) were produced by the reference Python
+# interpreter (run_svrf_drc.py) and COMMITTED as the frozen oracle. The Python
+# interpreter has since been RETIRED (the native C++ buddy is the shipped path),
+# so this test no longer regenerates them live -- it diffs the native engine's
+# output against the committed golden. To re-freeze after an intentional engine
+# change, delete the golden and re-run once against a trusted reference.
 #
 # It:
 #   1. builds engine_smoke (dbSVRFDeck.cc + dbSVRFEngine.cc + engine_smoke.cc)
 #      against a KLayout db build (KLAYOUT_SRC + KLAYOUT_BLD + KLAYOUT_BIN),
-#   2. generates the synthetic GDS fixtures + Python golden inside the
-#      vibeic-eda container (which ships klayout + this same svrf_klayout),
-#   3. runs the native engine on the same inputs and diffs against the golden.
+#   2. generates the synthetic GDS fixtures inside the vibeic-eda container
+#      (klayout `pya` Layout builders -- NOT the SVRF interpreter),
+#   3. runs the native engine on those inputs and diffs against the frozen golden.
 #
 # Env (override as needed):
 #   KLAYOUT_SRC   klayout source tree      (default ~/kbuild)
 #   KLAYOUT_BLD   klayout build dir        (default ~/kbuild-out/bld)
 #   KLAYOUT_BIN   klayout installed libs   (default ~/kbuild-out/bin)
-#   EDA_IMAGE     container w/ klayout     (default ghcr.io/vibeic/vibeic-eda:0.2.10)
+#   EDA_IMAGE     container w/ klayout     (default ghcr.io/vibeic/vibeic-eda:0.2.11)
 #
 set -euo pipefail
 
@@ -55,30 +62,32 @@ for row in "${CORPORA[@]}"; do
   cp "$HERE/$3"               "$WORK/"
 done
 
-echo "== 2. generate synthetic GDS + Python golden (container) =="
-GEN=""; GOLD=""
+echo "== 2. generate synthetic GDS fixtures (container klayout pya) =="
+GEN=""
 for row in "${CORPORA[@]}"; do
   set -- $row
   GEN="$GEN klayout -b -r /work/$3 >/dev/null 2>&1;"
-  GOLD="$GOLD klayout -b -r /myfork/svrf_klayout/run_svrf_drc.py -rd root=/myfork -rd deck=/work/$1.rule -rd layout=/work/$2.gds -rd report=/work/${1}_golden.txt >/dev/null 2>&1;"
 done
-docker run --rm --entrypoint bash -v "$SVRF":/myfork -v "$WORK":/work "$IMAGE" -lc "
+docker run --rm --entrypoint bash -v "$WORK":/work "$IMAGE" -lc "
   export PATH=/foss/tools/klayout:\$PATH
   $GEN
-  $GOLD
 "
 
-echo "== 3. run native engine + diff =="
+echo "== 3. run native engine + diff vs FROZEN golden =="
 rc=0
 for row in "${CORPORA[@]}"; do
   set -- $row
   deck="$1"; gds="$2"
+  golden="$HERE/engine_${deck}.golden"
+  if [ ! -f "$golden" ]; then
+    echo "  $deck: FAIL (no frozen golden at $golden)"; rc=1; continue
+  fi
   "$BIN" "$WORK/$deck.rule" "$WORK/$gds.gds" "$WORK/${deck}_cpp.txt" \
      "KLayout 0.30.9" "/work/$deck.rule" "/work/$gds.gds"
-  if diff "$WORK/${deck}_golden.txt" "$WORK/${deck}_cpp.txt" >/dev/null; then
-    echo "  $deck: PASS (byte-identical)"
+  if diff "$golden" "$WORK/${deck}_cpp.txt" >/dev/null; then
+    echo "  $deck: PASS (byte-identical to frozen golden)"
   else
-    echo "  $deck: FAIL"; diff "$WORK/${deck}_golden.txt" "$WORK/${deck}_cpp.txt" || true; rc=1
+    echo "  $deck: FAIL"; diff "$golden" "$WORK/${deck}_cpp.txt" || true; rc=1
   fi
 done
 

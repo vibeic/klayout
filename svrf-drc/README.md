@@ -1,9 +1,20 @@
 # svrf-drc — SVRF-native DRC, built into KLayout (vibeic fork)
 
 KLayout reads a **Calibre/SVRF-format DRC deck** (`.rule`) and executes every rule
-**directly on its own DRC engine** — `pya.Region.*_check` for geometry and
-`pya.LayoutToNetlist` for connectivity. There is **no transcoder / compiler and no
-intermediate `.drc` file**: KLayout ingests the deck format and solves it natively.
+**directly on its own DRC engine** — `db::Region::*_check` for geometry and
+`db::LayoutToNetlist` for connectivity. There is **no transcoder / compiler, no
+intermediate `.drc` file, and no scripting interpreter**: the deck is parsed and
+solved **natively in C++**, shipped as the `svrfdrc` command-line buddy.
+
+> **Native C++, not a Python interpreter.** The parser (`db::parse_deck`) and the
+> engine (`db::SVRFEngine`) live in `src/plugins/tools/svrf_drc/db_plugin/`
+> (`dbSVRFDeck.{h,cc}` + `dbSVRFEngine.{h,cc}`), compiled into the fork's
+> `libklayout_bd.so`; the `svrfdrc(int, char**)` entry is in
+> `src/buddies/src/bd/svrfdrc.cc`. The earlier Python reference implementation
+> (`svrf_klayout/*.py` run via `klayout -b -r`) has been **retired** — its report
+> output is reproduced byte-for-byte by the C++ engine (proven on the real ~87 k-line
+> foundry deck and on the synthetic corpora; see *Testing*), and the frozen goldens
+> it produced remain the regression oracle.
 
 ## Why this is not a transcoder
 
@@ -38,7 +49,7 @@ Every SVRF measurement modifier maps **1:1 onto a native KLayout check parameter
 | `a COINCIDENT [INSIDE\|OUTSIDE] EDGE b` | `a.edges() & b.edges()` (+ direction split) |
 | `a TOUCH EDGE b` | `a.edges().interacting(b)` |
 | `e LENGTH <rel> n` / `e ANGLE <rel> n` | `with_length(...)` / `with_angle(...)` |
-| `EXPAND EDGE a [INSIDE\|OUTSIDE] BY n` | `edges().extended_in/out(n)` (→ Region strip) |
+| `EXPAND EDGE a [INSIDE\|OUTSIDE] BY n` | `edges().extended(...,n,...)` (→ Region strip) |
 | `EXTERNAL / INTERNAL / ENCLOSURE` on an edge layer | `Edges.separation_check / width_check / enclosing_check` |
 
 ### Windowed density & per-net area ratio (native)
@@ -56,50 +67,62 @@ the Calibre format executes natively here.
 ## Layout
 
 ```
+src/plugins/tools/svrf_drc/db_plugin/
+  dbSVRFDeck.{h,cc}     # native C++ SVRF deck parser  (db::parse_deck)
+  dbSVRFEngine.{h,cc}   # native C++ engine            (db::SVRFEngine) — byte-identical report
+src/buddies/src/bd/svrfdrc.cc         # the svrfdrc(argc,argv) buddy entry (BD_TARGET dispatch)
+src/buddies/src/svrfdrc/svrfdrc.pro   # per-buddy .pro (linked into the `svrfdrc` CLI)
+
 svrf-drc/
-  svrf_klayout/svrf_parse.py       # pure-Python SVRF deck parser (unit-testable, no pya)
-  svrf_klayout/run_svrf_drc.py     # the in-KLayout interpreter (Engine; uses pya)
-  svrf_klayout/edge_pair_check.py  # from-first-principles reference geometry (dual-track cross-check)
-  pymacros/svrf_drc.lym            # KLayout macro: Tools -> "SVRF-native DRC…" + run_svrf_deck()
-  examples/demo.rule, conn.rule    # synthetic decks (NO vendor data)
-  gen/                             # test-structure generators
-  tests/                           # pytest (pure Python)
-  proof.py                         # FAIL->PASS proof: geometric + connectivity core (run in KLayout)
-  proof2.py                        # FAIL->PASS proof: edge pipeline / density / net-ratio (run in KLayout)
-  audit_realdeck.py                # dispatch-coverage auditor for ANY SVRF deck (-rd deck=<path>)
+  examples/*.rule       # synthetic decks (NO vendor data): demo, conn, coverage(2), opdiff, empty
+  gen/                  # pya test-structure generators (no interpreter)
+  tests/
+    *.golden            # FROZEN oracle (parser dumps + engine reports; regression source of truth)
+    dump_parse_cpp.cc   # C++ parse-dump tool (diffed vs demo/conn/coverage.golden)
+    engine_smoke.cc     # C++ engine driver (diffed vs engine_*.golden)
+    gen_*_gds.py        # pya GDS-fixture builders (klayout -b -r; NOT the SVRF interpreter)
+    run_parse_parity.sh # build dump_parse_cpp + diff vs frozen parser goldens
+    run_engine_parity.sh# build engine_smoke + gen fixtures + diff vs frozen engine goldens
 ```
 
 ## Coverage
 
 Every statement of a real production Calibre DRC deck (a commercial 180 nm foundry
-deck, ~87 k lines / ~7.4 k executable rules) dispatches to a native KLayout check —
-**0 SKIP, 0 unmodeled** (measured by `audit_realdeck.py`). Dispatch coverage proves
-each rule *runs*; `proof.py` + `proof2.py` prove each check *discriminates* (FAILs on
-a real violation, PASSes when clean) on targeted geometry.
+deck, ~87 k lines) dispatches to a native KLayout check — **0 SKIP for any modeled
+rule** (`ANTENNA` is the sole honest cross-tool route). The native engine reproduces
+the retired Python reference **byte-for-byte** on that deck (identical tally + every
+rule line), which is the load-bearing correctness gate for the cutover.
 
 ## Run
 
 ```bash
-# batch, no GUI:
-klayout -b -r svrf_klayout/run_svrf_drc.py \
-    -rd root=$PWD -rd deck=examples/demo.rule -rd layout=build/test.gds -rd report=out.txt
+# native buddy — batch, no GUI, no Python:
+svrfdrc <deck.rule> <layout.gds> <report.txt> [--cell=<TOP>]
+#   e.g. svrfdrc examples/demo.rule build/test.gds out.txt --cell=TOP
 
-# self-proofs (generate structures, assert FAIL<->PASS discrimination):
-klayout -b -r proof.py  -rd root=$PWD    # -> "SVRF-DRC PROOF: PASS"
-klayout -b -r proof2.py -rd root=$PWD    # -> "SVRF-DRC PROOF2 ... : PASS"
-
-# dispatch-coverage audit of any SVRF deck:
-klayout -b -r audit_realdeck.py -rd root=$PWD -rd deck=<your.rule>
-
-# parser unit tests (no KLayout needed):
-python3 -m pytest tests/ -q
+# (shipped on PATH inside the vibeic-eda image as /foss/tools/bin/svrfdrc)
+svrfdrc --help
 ```
 
-## Dual-track honesty
+## Testing (no Python / no commercial tool)
 
-`edge_pair_check.py` is an independent from-first-principles implementation of the
-same standard geometry (Euclidian/Projection metric, `angle_limit`/ABUT gate). It
-lets the interpreter's verdicts be **cross-checked without any commercial tool** —
-turning a "golden reference run" from a semantic oracle into a regression test.
+The regression oracle is the set of **frozen goldens** in `tests/` — parser dumps
+(`demo`/`conn`/`coverage`) and engine reports (`coverage`/`coverage2`/`opdiff`/`empty`)
+originally produced by the reference Python implementation and now reproduced
+byte-for-byte by the C++ parser and engine:
+
+```bash
+# parser parity: C++ db::parse_deck dump == frozen golden
+bash tests/run_parse_parity.sh
+
+# engine parity: C++ db::SVRFEngine report == frozen golden
+#   (generates the synthetic GDS via klayout `pya` builders, then runs the native engine)
+EDA_IMAGE=ghcr.io/vibeic/vibeic-eda:0.2.11 bash tests/run_engine_parity.sh
+```
+
+Both need a KLayout db build (`KLAYOUT_SRC`/`KLAYOUT_BLD`/`KLAYOUT_BIN`, default
+`~/kbuild` + `~/kbuild-out`) to compile the C++ test drivers. No SVRF interpreter is
+involved on either side — the goldens are static, so the comparison is a pure
+regression test rather than a live semantic oracle.
 
 Contains **no vendor / foundry data** — only general SVRF semantics.

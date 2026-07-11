@@ -1,6 +1,7 @@
 // coverage.rule — SYNTHETIC deck exercising every parser branch (NO vendor data).
 // Not geometrically meaningful; used only to cross-check the native C++ parser
-// (dbSVRFDeck) against the reference Python parser (svrf_parse.py).
+// (dbSVRFDeck) against the FROZEN parse-dump golden (tests/coverage.golden,
+// originally produced by the now-retired reference Python parser).
 
 // --- two-level Calibre LAYER + MAP form (bare number is an INDEX, not a GDS layer) ---
 LAYER metal1 100

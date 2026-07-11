@@ -1,5 +1,5 @@
 // demo.rule — a synthetic Calibre/SVRF-format deck (NO vendor data).
-// Executed natively by KLayout via run_svrf_drc.py (no compiler, no .drc file).
+// Executed natively by KLayout's `svrfdrc` C++ buddy (no compiler, no .drc file).
 
 LAYER metal1 34 0
 LAYER metal2 36 0

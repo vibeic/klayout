@@ -1,0 +1,12 @@
+# SVRF-native DRC via KLayout KLayout 0.30.9
+# deck=/work/empty.rule  layout=/work/empty.gds  dbu=0.001
+# 3 layers, 6 derivations, 6 rules  |  {'PASS': 2, 'FAIL': 4}
+
+PASS  AI                 COPY ai  0.0 [COPY] -> 0
+PASS  AN                 COPY an  0.0 [COPY] -> 0
+FAIL  AX                 COPY ax  0.0 [COPY] -> 1
+FAIL  ANOT               COPY anot  0.0 [COPY] -> 1
+FAIL  AO                 COPY ao  0.0 [COPY] -> 1
+FAIL  ANI                COPY ani  0.0 [COPY] -> 1
+
+# tally: {'PASS': 2, 'FAIL': 4}

@@ -1,0 +1,11 @@
+# SVRF-native DRC via KLayout KLayout 0.30.9
+# deck=/work/opdiff.rule  layout=/work/opdiff.gds  dbu=0.001
+# 4 layers, 5 derivations, 5 rules  |  {'PASS': 1, 'FAIL': 4}
+
+PASS  NR_CHK             COPY nr  0.0 [COPY] -> 0
+FAIL  NI_CHK             COPY ni  0.0 [COPY] -> 1
+FAIL  CU_CHK             COPY cu  0.0 [COPY] -> 1
+FAIL  OR_CHK             COPY orl  0.0 [COPY] -> 2
+FAIL  NOT_CHK            COPY notl  0.0 [COPY] -> 2
+
+# tally: {'PASS': 1, 'FAIL': 4}

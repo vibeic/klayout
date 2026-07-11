@@ -52,8 +52,9 @@ buddy binary only.
 ## Increments (each committed on branch `vibeic/svrf-native-drc`)
 
 1. **C++ parser `db::SVRFDeck`** — port `svrf_klayout/svrf_parse.py` (self-contained,
-   `<regex>` only, no db:: deps). Cross-checked byte-for-byte against the Python
-   parser via `tests/dump_parse.py` goldens (`demo`/`conn`/`coverage`). *[in progress]*
+   `<regex>` only, no db:: deps). Cross-checked byte-for-byte against the frozen
+   parser-dump goldens (`demo`/`conn`/`coverage`) via `tests/dump_parse_cpp.cc` +
+   `tests/run_parse_parity.sh`. **[DONE]**
 2. **C++ engine `db::SVRFEngine`** — port `run_svrf_drc.py`; dispatch each rule onto
    `db::Region::{space,separation,width,overlap,notch,enclosing}_check` (+
    `RegionCheckOptions`), `db::Edges`, `db::LayoutToNetlist` (CONNECT / NET AREA
@@ -109,10 +110,37 @@ buddy binary only.
      pya) and is **byte-identical** to the reference Python on both synthetic corpora.
 4. **container re-bake + plugin rewire + delete Python** — bump vibeic-eda
    `ARG KLAYOUT_REF`; Stage-6 recompiles klayout (buddy ships in `bld`); drop Stage-7
-   Python sparse-checkout. Rewire the **6** plugin touchpoints (`phase3_one_shot_runner
-   ._try_svrf_native_drc` → run `svrfdrc`; `_svrf_drc_root*` → probe the native binary;
-   `drc-fix` SKILL + 2 tests reword). **Verify byte-parity native-vs-Python on the
-   commercial-PDK deck BEFORE deleting Python.** Then remove `svrf_klayout/*.py` + `.lym`.
+   Python sparse-checkout. Rewire the plugin touchpoints (`phase3_one_shot_runner
+   ._try_svrf_native_drc` → run `svrfdrc`; `_svrfdrc_bin_container` → probe the native
+   binary; `drc-fix` SKILL + 2 tests reword). **Verify byte-parity native-vs-Python on the
+   commercial-PDK deck BEFORE deleting Python.** Then remove `svrf_klayout/*.py` + `.lym`. **[DONE]**
+   - **Image `vibeic-eda:0.2.11`** ships the buddy at `/foss/tools/bin/svrfdrc`. Stage-7
+     Python source-checkout retired; the runtime install is a **wrapper** (not a bare
+     symlink): the buddy's ELF carries `DT_RUNPATH=/foss/tools/klayout-vibeic`, but the
+     runtime env sets `LD_LIBRARY_PATH=/foss/tools/klayout` and **DT_RUNPATH is searched
+     AFTER LD_LIBRARY_PATH** — a bare symlink therefore loads the STOCK
+     `/foss/tools/klayout/libklayout_bd.so` (which lacks the `svrfdrc` symbol + engine) →
+     `undefined symbol: svrfdrc(int, char**)`. The wrapper prepends the fork lib dir to
+     `LD_LIBRARY_PATH` so all klayout libs resolve from the fork build. The build-time
+     self-test now runs under `LD_LIBRARY_PATH=/foss/tools/klayout` to reproduce the
+     runtime condition (catches the bug at build time).
+   - **★ IN-IMAGE SAFETY GATE PASSED:** the baked wrapper `svrfdrc` (resolved via
+     `command -v svrfdrc` exactly as the plugin does, under the real runtime env) run on
+     the REAL commercial-PDK deck + spm sign-off GDS produces a report **byte-identical** to the
+     retired Python golden — 4,533 verdict lines, all 10 FAIL lines match, tally
+     `{'PASS': 4523, 'FAIL': 10}` (only the argv path-echo header line differs, not a
+     result). 0.92 s. This cleared Python for deletion.
+   - **Python deleted** from the fork: `svrf_klayout/{__init__,edge_pair_check,run_svrf_drc,
+     svrf_parse}.py`, `pymacros/svrf_drc.lym`, the interpreter-dependent dev/proof scripts
+     (`audit_realdeck.py`, `proof.py`, `proof2.py`), and the Python-only tests
+     (`tests/{test_svrf_parse,test_edge_pair_check,dump_parse}.py`). Kept: the pya GDS/
+     test-structure builders (`gen/`, `tests/gen_*_gds.py`) — those use `pya.Layout`, not
+     the SVRF interpreter.
+   - **Regression preserved without Python:** `tests/run_parse_parity.sh` (C++ parser dump
+     vs frozen `demo`/`conn`/`coverage` goldens) + `tests/run_engine_parity.sh` (C++ engine
+     vs frozen `coverage`/`coverage2`/`opdiff`/`empty` goldens, now diffing the COMMITTED
+     goldens instead of live-generating them via Python). Both pass byte-identical
+     post-deletion.
 
    **★ REAL-DECK PARITY GATE PASSED (the load-bearing safety check for step 4).**
    The native `svrfdrc` buddy binary is **byte-identical** to the reference
@@ -140,8 +168,8 @@ buddy binary only.
      net-ratio) + `examples/empty.rule` (ops with an empty operand — the pflag bug);
      `tests/run_engine_parity.sh` now diffs all 4 corpora.
 
-   Remaining step-4 work (mechanical, no NDA blockers): re-bake the image, rewire the 6
-   plugin touchpoints, then delete the Python.
+   All step-4 work complete — the native C++ buddy is the shipped DRC path; the Python
+   interpreter is fully retired.
 
 ## Effort / risk
 
