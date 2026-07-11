@@ -26,6 +26,10 @@ root = globals().get("root", ".")
 deck_path = globals().get("deck")
 layout_path = globals().get("layout")
 report_path = globals().get("report", "svrf_drc_report.txt")
+# Optional explicit top cell — required when the layout has multiple top cells
+# (e.g. a design GDS that also carries a stray un-instantiated PDK-library top).
+# When absent the engine falls back to the single top_cell() (unchanged).
+cell_name = globals().get("cell")
 
 sys.path.insert(0, root)
 from svrf_klayout.svrf_parse import parse_deck, Derivation, Rule  # noqa: E402
@@ -41,10 +45,21 @@ class _NetLayerUnavailable(Exception):
 
 
 class Engine:
-    def __init__(self, layout_path, deck_text):
+    def __init__(self, layout_path, deck_text, top_cell_name=None):
         self.layout = pya.Layout()
         self.layout.read(layout_path)
-        self.top = self.layout.top_cell()
+        if top_cell_name:
+            c = self.layout.cell(top_cell_name)
+            if c is None:
+                raise RuntimeError(
+                    f"top cell {top_cell_name!r} not found in layout "
+                    f"{layout_path!r} (cells: "
+                    f"{[self.layout.cell(t).name for t in self.layout.each_top_cell()]})")
+            self.top = c
+        else:
+            # single-top layouts: unchanged behaviour (raises on multi-top,
+            # which is the honest signal to pass an explicit `cell=`).
+            self.top = self.layout.top_cell()
         self.dbu = self.layout.dbu
         self.deck = parse_deck(deck_text)
         self.regions = {}          # name -> pya.Region (drawn / derived / error)
@@ -606,7 +621,7 @@ class Engine:
 
 def main():
     deck_text = open(deck_path, encoding="utf-8", errors="replace").read()
-    eng = Engine(layout_path, deck_text)
+    eng = Engine(layout_path, deck_text, cell_name)
     eng.execute()
     ver = pya.Application.instance().version() if pya.Application.instance() else ""
     from collections import Counter
