@@ -716,6 +716,18 @@ static SVRFDerivation parse_derivation (const std::string &name, const std::stri
           d.params["dir_vals"] = vals;
         }
       }
+      //  morphological OVERUNDER (close) / UNDEROVER (open) modifier:
+      //  Calibre `SIZE L BY d OVERUNDER` = oversize by d THEN undersize by d
+      //  (closing: fills notches/gaps < 2d, bridges near shapes); UNDEROVER =
+      //  undersize THEN oversize (opening: erases spikes/thin necks < 2d,
+      //  keeps only cores). These are how the deck DERIVES dense-array cores
+      //  (CT.S/CT.OT contact-array membership, implant array_not_check) — a
+      //  plain isotropic size treats every shape as an array member and floods
+      //  spurious spacing/enclosure violations. Capture the token; the engine
+      //  applies the two-step.
+      for (const auto &u : up) {
+        if (u == "OVERUNDER" || u == "UNDEROVER") { d.params["morph"] = u; break; }
+      }
       if (d.operands.empty ()) {
         d.supported = false; d.reason = "size without a layer";
       }

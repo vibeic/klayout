@@ -626,7 +626,22 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d)
         }
         m_regions[d.name] = r;
       } else {
-        m_regions[d.name] = resolve (d.operands[0]).sized (to_dbu (d.has_value ? d.value : 0.0));
+        auto it_morph = d.params.find ("morph");
+        if (it_morph != d.params.end () && d.has_value) {
+          //  OVERUNDER = close (grow then shrink); UNDEROVER = open
+          //  (shrink then grow). d.value is +ve for SIZE ... BY d; the
+          //  two-step derives dense-array cores / removes thin necks.
+          db::Coord dd = to_dbu (std::abs (d.value));
+          db::Region r = resolve (d.operands[0]);
+          if (it_morph->second == "OVERUNDER") {
+            r = r.sized (dd); r = r.sized (-dd);
+          } else {  // UNDEROVER
+            r = r.sized (-dd); r = r.sized (dd);
+          }
+          m_regions[d.name] = r;
+        } else {
+          m_regions[d.name] = resolve (d.operands[0]).sized (to_dbu (d.has_value ? d.value : 0.0));
+        }
       }
     } else if (k == "select") {
       db::Region a = resolve (d.operands[0]);
@@ -862,6 +877,17 @@ void SVRFEngine::exec_edge_rule (const SVRFRule &r)
   size_t cnt = ep.count ();
   db::Region errpoly;
   ep.polygons (errpoly);
+  //  SVRFDRC_VIOBBOX=1: dump the first violation bboxes (um) per failing
+  //  rule to stderr — parity triage needs a LOCATION to inspect, not a tally.
+  if (cnt > 0 && getenv ("SVRFDRC_VIOBBOX")) {
+    int nb = 0;
+    for (db::Region::const_iterator vp = errpoly.begin (); ! vp.at_end () && nb < 5; ++vp, ++nb) {
+      db::Box bx = (*vp).box ();
+      fprintf (stderr, "VIOBBOX %s %.3f %.3f %.3f %.3f\n", r.name.c_str (),
+               bx.left () * m_dbu, bx.bottom () * m_dbu,
+               bx.right () * m_dbu, bx.top () * m_dbu);
+    }
+  }
   m_regions[r.name] = errpoly;
   SVRFResult res; res.rule = &r;
   res.verdict = cnt == 0 ? "PASS" : "FAIL";
@@ -1076,6 +1102,15 @@ void SVRFEngine::exec_rule (const SVRFRule &r)
     ep.polygons (viol);
   }
   size_t cnt = have_ep ? ep.count () : viol.count ();
+  if (cnt > 0 && getenv ("SVRFDRC_VIOBBOX")) {
+    int nb = 0;
+    for (db::Region::const_iterator vp = viol.begin (); ! vp.at_end () && nb < 5; ++vp, ++nb) {
+      db::Box bx = (*vp).box ();
+      fprintf (stderr, "VIOBBOX %s %.3f %.3f %.3f %.3f\n", r.name.c_str (),
+               bx.left () * m_dbu, bx.bottom () * m_dbu,
+               bx.right () * m_dbu, bx.top () * m_dbu);
+    }
+  }
   m_regions[r.name] = viol;              // this measurement IS an error layer
   SVRFResult res; res.rule = &r;
   res.verdict = cnt == 0 ? "PASS" : "FAIL";
