@@ -593,19 +593,36 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d)
         //  size — Calibre's wide-metal derivation idiom relies on this;
         //  treating the qualifier as isotropic corrupted every
         //  wide-metal chains chain (commercial-PDK a metal1-spacing rule/a wide-metal spacing rule phantoms).
-        db::Coord v = to_dbu (d.has_value ? d.value : 0.0);   // signed
-        db::Coord h = v / 2;
-        db::Coord t = v - h;                                   // dbu-exact split
-        const std::string &dir = it_dir->second;
+        //  possibly a NESTED one-line chain (SHRINK(SHRINK(...R 5) L 5)...):
+        //  apply every (dir, value) pair in token order (innermost-out).
+        std::vector<std::string> dirs;
+        std::vector<double> vals;
+        {
+          std::stringstream ds (it_dir->second);
+          std::string tok;
+          while (std::getline (ds, tok, ',')) { dirs.push_back (tok); }
+          auto it_v = d.params.find ("dir_vals");
+          if (it_v != d.params.end ()) {
+            std::stringstream vs (it_v->second);
+            while (std::getline (vs, tok, ',')) { vals.push_back (std::atof (tok.c_str ())); }
+          }
+        }
         db::Region r = resolve (d.operands[0]);
-        if (dir == "RIGHT") {
-          r = r.sized (h, 0); r.transform (db::Disp (db::Vector (t, 0)));
-        } else if (dir == "LEFT") {
-          r = r.sized (h, 0); r.transform (db::Disp (db::Vector (-t, 0)));
-        } else if (dir == "TOP") {
-          r = r.sized (0, h); r.transform (db::Disp (db::Vector (0, t)));
-        } else {  // BOTTOM
-          r = r.sized (0, h); r.transform (db::Disp (db::Vector (0, -t)));
+        for (size_t i = 0; i < dirs.size (); ++i) {
+          double vv = (i < vals.size ()) ? vals[i] : (d.has_value ? d.value : 0.0);
+          db::Coord v = to_dbu (vv);                           // signed
+          db::Coord h = v / 2;
+          db::Coord t = v - h;                                 // dbu-exact split
+          const std::string &dir = dirs[i];
+          if (dir == "RIGHT") {
+            r = r.sized (h, 0); r.transform (db::Disp (db::Vector (t, 0)));
+          } else if (dir == "LEFT") {
+            r = r.sized (h, 0); r.transform (db::Disp (db::Vector (-t, 0)));
+          } else if (dir == "TOP") {
+            r = r.sized (0, h); r.transform (db::Disp (db::Vector (0, t)));
+          } else {  // BOTTOM
+            r = r.sized (0, h); r.transform (db::Disp (db::Vector (0, -t)));
+          }
         }
         m_regions[d.name] = r;
       } else {
@@ -759,6 +776,30 @@ db::EdgesCheckOptions SVRFEngine::edge_check_options (const SVRFRule &r) const
   return o;
 }
 
+//  Calibre EXT/INT/ENC default: COINCIDENT (collinear-overlapping, "flush")
+//  edge pairs are TOUCHING, not spacing violations — abutting-cell implant /
+//  act / met flush boundaries are legal. KLayout's checks report them at
+//  distance 0. Drop pairs whose edges are parallel AND intersecting (parallel
+//  edges can only intersect when collinear-overlapping); endpoint abutments
+//  at an angle stay (that is what ABUT<n / ignore_angle governs).
+//  On the commercial-PDK full-FEOL spm GDS this phantom class alone accounted for
+//  the per-cell-count families (imp enclosure x1069, NPSD/PPSD waves, ...).
+static db::EdgePairs drop_coincident_pairs (const db::EdgePairs &ep)
+{
+  db::EdgePairs out;
+  for (auto p = ep.begin (); ! p.at_end (); ++p) {
+    const db::Edge &a = (*p).first ();
+    const db::Edge &b = (*p).second ();
+    bool parallel = ((long long) a.dx () * (long long) b.dy ()
+                     - (long long) a.dy () * (long long) b.dx ()) == 0;
+    if (parallel && a.intersect (b)) {
+      continue;                       //  flush/coincident touching — legal
+    }
+    out.insert (*p);
+  }
+  return out;
+}
+
 bool SVRFEngine::inputs_unmodeled (const SVRFRule &r) const
 {
   if (! r.layer1.empty () && m_unmodeled.count (r.layer1)) {
@@ -817,6 +858,7 @@ void SVRFEngine::exec_edge_rule (const SVRFRule &r)
     m_results.push_back (res);
     return;
   }
+  ep = drop_coincident_pairs (ep);
   size_t cnt = ep.count ();
   db::Region errpoly;
   ep.polygons (errpoly);
@@ -1027,6 +1069,11 @@ void SVRFEngine::exec_rule (const SVRFRule &r)
     res.info = "check error";
     m_results.push_back (res);
     return;
+  }
+  if (have_ep) {
+    ep = drop_coincident_pairs (ep);
+    viol.clear ();
+    ep.polygons (viol);
   }
   size_t cnt = have_ep ? ep.count () : viol.count ();
   m_regions[r.name] = viol;              // this measurement IS an error layer

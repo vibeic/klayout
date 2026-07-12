@@ -692,8 +692,29 @@ static SVRFDerivation parse_derivation (const std::string &name, const std::stri
       //  (commercial-PDK wide-metal chains chains) — the exact one-sided form is
       //  a half-size on that axis plus a half translation (erosion/dilation
       //  by an off-center segment), applied in the engine.
-      for (const char *dir : {"RIGHT", "LEFT", "TOP", "BOTTOM"}) {
-        if (has (dir)) { d.params["dir"] = dir; break; }
+      //  Decks NEST these on ONE line — SHRINK(SHRINK(SHRINK(SHRINK X R 5)
+      //  L 5) T 5) B 5 — and the paren-flattening tokenizer used to keep
+      //  only the FIRST direction (a single R5: long rails survived ->
+      //  phantom wide metal). Collect ALL directions + values in token
+      //  order (innermost-out) and let the engine apply them sequentially.
+      {
+        std::string dirs, vals;
+        size_t vi = 0;
+        for (size_t ti = 0; ti < up.size (); ++ti) {
+          if (up[ti] == "RIGHT" || up[ti] == "LEFT" ||
+              up[ti] == "TOP" || up[ti] == "BOTTOM") {
+            if (!dirs.empty ()) { dirs += ","; vals += ","; }
+            dirs += up[ti];
+            double v = (vi < nn.size ()) ? nn[vi] : (nn.empty () ? 0.0 : nn.back ());
+            if ((t == "SHRINK" || t == "UNDERSIZE")) { v = -std::abs (v); }
+            vals += std::to_string (v);
+            ++vi;
+          }
+        }
+        if (!dirs.empty ()) {
+          d.params["dir"] = dirs;
+          d.params["dir_vals"] = vals;
+        }
       }
       if (d.operands.empty ()) {
         d.supported = false; d.reason = "size without a layer";
