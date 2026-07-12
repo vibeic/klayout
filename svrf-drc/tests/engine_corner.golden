@@ -1,0 +1,8 @@
+# SVRF-native DRC via KLayout KLayout 0.30.9
+# deck=/work/corner.rule  layout=/work/corner.gds  dbu=0.001
+# 1 layers, 0 derivations, 2 rules  |  {'FAIL': 2}
+
+FAIL  CORNER.PLAIN.EUCLID EXTERNAL met < 0.23 [metrics=euclidian] -> 3
+FAIL  CORNER.ABUT        EXTERNAL met < 0.23 [metrics=euclidian,ignore_angle=90.0] -> 1
+
+# tally: {'FAIL': 2}

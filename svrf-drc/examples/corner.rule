@@ -1,0 +1,21 @@
+// corner.rule -- SYNTHETIC regression guard for the §4.05 corner-to-corner fix.
+// Two axis-aligned squares placed DIAGONALLY corner-to-corner (nearest vertices
+// 0.212um apart) plus a FACING pair (0.15um). NO vendor data.
+//
+// CORNER.PLAIN.EUCLID: a plain Euclidian REGION spacing rule. Euclidian metric
+//   "also considers the corners", so the 0.212um<0.23 diagonal gap is a REAL
+//   violation and MUST be flagged. This is the leniency-mask regression guard:
+//   the ABUT-gated corner drop must NEVER suppress a plain-Euclidian corner
+//   violation (a false-clean is worse than a false-fail). -> 3 (2 diagonal + 1 facing).
+// CORNER.ABUT: the same check WITH an ABUT qualifier (abutting-layer corner
+//   handling). The diagonal abutment corner is dropped; only the facing pair
+//   (projection>0) survives. -> 1.
+LAYER met 20 0
+
+CORNER.PLAIN.EUCLID {
+  EXTERNAL met < 0.23 REGION
+}
+
+CORNER.ABUT {
+  EXTERNAL met < 0.23 ABUT < 90 REGION
+}

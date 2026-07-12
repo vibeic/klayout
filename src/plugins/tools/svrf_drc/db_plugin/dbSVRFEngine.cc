@@ -889,7 +889,8 @@ static long long parallel_proj_overlap (const db::Edge &a, const db::Edge &b)
   return std::min (amax, bmax) - std::max (amin, bmin);
 }
 
-static db::EdgePairs drop_coincident_pairs (const db::EdgePairs &ep, bool region_out)
+static db::EdgePairs drop_coincident_pairs (const db::EdgePairs &ep,
+                                            bool region_out, bool abut_rule)
 {
   db::EdgePairs out;
   for (auto p = ep.begin (); ! p.at_end (); ++p) {
@@ -900,15 +901,27 @@ static db::EdgePairs drop_coincident_pairs (const db::EdgePairs &ep, bool region
     if (parallel && a.intersect (b)) {
       continue;                       //  flush/coincident touching — legal
     }
-    //  Calibre EXT/INT/ENC "... REGION" reports a violation only where a 2D
-    //  error REGION forms between two FACING (projection-overlapping) edges.
-    //  Two PARALLEL edges that meet only at a corner (zero projection overlap)
-    //  — the ubiquitous active/well/implant staircase-interface jog of an
-    //  abutting foundry cell — form no such region, yet KLayout's Euclidian
-    //  separation_check still reports the corner-to-corner distance. Drop those
-    //  for REGION rules ONLY. A genuine facing-edge spacing violation always
-    //  has projection overlap > 0, so this can never mask a real gap.
-    if (region_out && parallel && parallel_proj_overlap (a, b) <= 0) {
+    //  Corner-only jog of an ABUTTING-layer interface: two PARALLEL edges of
+    //  the two abutting layers meeting only at a corner (zero projection
+    //  overlap) — the ubiquitous active/well/implant staircase jog of an
+    //  abutting foundry cell. Calibre's `ABUT` modifier governs exactly this
+    //  abutting-edge corner handling; `ABUT>0<90` (parsed into ignore_angle)
+    //  excludes the 0deg/90deg abutment corners. KLayout's Euclidian
+    //  separation_check still reports the corner-to-corner distance, so drop
+    //  those pairs — but ONLY for rules the deck author wrote with an ABUT
+    //  qualifier (abut_rule == has_ignore_angle). This gate is load-bearing for
+    //  §4.05: a plain Euclidian/Square `EXTERNAL met < s REGION` (metal / via /
+    //  net spacing, INCLUDING the `NOT CONNECTED` different-net path) carries NO
+    //  ABUT, so its genuine diagonal corner-to-corner violations are NEVER
+    //  dropped — Euclidian/Square metrics legitimately flag a diagonal
+    //  short/pinch and masking one would be a false-clean (worse than a
+    //  false-fail). Documented residual: a genuine NON-touching diagonal gap
+    //  between two ABUT-rule layers is also dropped; ABUT rules are net-unaware
+    //  abutting-implant/active/well interface checks where such a gap is not the
+    //  manufacturing class they target, and foundry cells are DRC-clean by
+    //  construction. A facing-edge spacing violation always has projection
+    //  overlap > 0, so this never masks a facing (parallel-run) gap on any rule.
+    if (region_out && abut_rule && parallel && parallel_proj_overlap (a, b) <= 0) {
       continue;
     }
     out.insert (*p);
@@ -974,7 +987,7 @@ void SVRFEngine::exec_edge_rule (const SVRFRule &r)
     m_results.push_back (res);
     return;
   }
-  ep = drop_coincident_pairs (ep, r.region_out);
+  ep = drop_coincident_pairs (ep, r.region_out, r.has_ignore_angle);
   size_t cnt = ep.count ();
   db::Region errpoly;
   ep.polygons (errpoly);
@@ -1207,7 +1220,7 @@ void SVRFEngine::exec_rule (const SVRFRule &r)
     return;
   }
   if (have_ep) {
-    ep = drop_coincident_pairs (ep, r.region_out);
+    ep = drop_coincident_pairs (ep, r.region_out, r.has_ignore_angle);
     viol.clear ();
     ep.polygons (viol);
   }

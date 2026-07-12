@@ -55,6 +55,7 @@ CORPORA=(
   "coverage2 synth2 gen_synth2_gds.py"
   "opdiff    opdiff gen_opdiff_gds.py"
   "empty     empty  gen_empty_gds.py"
+  "corner    corner gen_corner_gds.py"
 )
 for row in "${CORPORA[@]}"; do
   set -- $row
