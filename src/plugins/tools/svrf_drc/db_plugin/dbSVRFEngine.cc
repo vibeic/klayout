@@ -11,6 +11,8 @@
 #include "dbSVRFEngine.h"
 
 #include "dbReader.h"
+#include "dbWriter.h"
+#include "dbSaveLayoutOptions.h"
 #include "dbRecursiveShapeIterator.h"
 #include "dbRegionUtils.h"
 #include "dbEdgesUtils.h"
@@ -267,6 +269,54 @@ const std::vector<SVRFResult> &SVRFEngine::execute ()
   for (std::vector<const SVRFRule *>::iterator c = copies.begin (); c != copies.end (); ++c) {
     exec_rule (**c);
   }
+  //  SVRFDRC_DUMP_GDS=name1,name2,... : write each named region/edge layer to
+  //  dump_layers.gds under the cwd (regions -> layer i/0, edges -> layer i/1
+  //  as zero-width paths). Parity-diagnosis aid: lets you SEE what a derived
+  //  intermediate actually contains vs what Calibre intends (no oracle).
+  if (const char *dl = getenv ("SVRFDRC_DUMP_GDS")) {
+    try {
+      db::Layout out;
+      out.dbu (m_dbu);
+      db::Cell &top = out.cell (out.add_cell ("DUMP"));
+      std::string spec (dl);
+      size_t i0 = 0; int li = 0;
+      while (i0 <= spec.size ()) {
+        size_t comma = spec.find (',', i0);
+        std::string nm = spec.substr (i0, comma == std::string::npos ? std::string::npos : comma - i0);
+        i0 = (comma == std::string::npos) ? spec.size () + 1 : comma + 1;
+        while (!nm.empty () && (nm.front () == ' ')) nm.erase (nm.begin ());
+        while (!nm.empty () && (nm.back () == ' ')) nm.pop_back ();
+        if (nm.empty ()) continue;
+        if (m_edge_layers.count (nm)) {
+          unsigned int lay = out.insert_layer (db::LayerProperties (li, 1));
+          std::map<std::string, db::Edges>::const_iterator ei = m_edges_ns.find (nm);
+          if (ei != m_edges_ns.end ()) {
+            for (db::Edges::const_iterator e = ei->second.begin (); !e.at_end (); ++e) {
+              top.shapes (lay).insert (*e);
+            }
+          }
+          fprintf (stderr, "DUMP %s -> layer %d/1 (edges)\n", nm.c_str (), li);
+        } else {
+          unsigned int lay = out.insert_layer (db::LayerProperties (li, 0));
+          std::map<std::string, db::Region>::const_iterator ri = m_regions.find (nm);
+          if (ri != m_regions.end ()) {
+            for (db::Region::const_iterator p = ri->second.begin (); !p.at_end (); ++p) {
+              top.shapes (lay).insert (*p);
+            }
+          }
+          fprintf (stderr, "DUMP %s -> layer %d/0 (region)\n", nm.c_str (), li);
+        }
+        ++li;
+      }
+      db::SaveLayoutOptions so; so.set_format ("GDS2");
+      db::Writer w (so);
+      tl::OutputStream os ("dump_layers.gds");
+      w.write (out, os);
+      fprintf (stderr, "DUMP wrote dump_layers.gds (%d layers)\n", li);
+    } catch (std::exception &e) {
+      fprintf (stderr, "DUMP failed: %s\n", e.what ());
+    }
+  }
   return m_results;
 }
 
@@ -510,7 +560,14 @@ db::Edges SVRFEngine::build_edges (const SVRFDerivation &d)
     return a.inside_part (resolve (d.operands[1]));
   }
   if (op == "OUTSIDE" && have_b) {
-    return a.outside_part (resolve (d.operands[1]));
+    //  Calibre OUTSIDE EDGE excludes edges COINCIDENT with b's boundary:
+    //  an edge lying on b's border is neither inside nor outside. KLayout's
+    //  outside_part keeps a boundary edge when its material faces away from
+    //  b (e.g. an abutting NACT/PACT interface at the shared boundary),
+    //  which flooded opposite-active spacing checks (commercial-PDK an active-spacing rule.*).
+    //  Subtract the boundary-coincident parts explicitly.
+    db::Region rb = resolve (d.operands[1]);
+    return a.outside_part (rb) - rb.edges ();
   }
   if (op == "TOUCH" && have_b) {
     return a.selected_interacting (resolve (d.operands[1]));
@@ -881,6 +938,15 @@ void SVRFEngine::exec_edge_rule (const SVRFRule &r)
   //  rule to stderr — parity triage needs a LOCATION to inspect, not a tally.
   if (cnt > 0 && getenv ("SVRFDRC_VIOBBOX")) {
     int nb = 0;
+    for (auto p = ep.begin (); ! p.at_end () && nb < 5; ++p, ++nb) {
+      const db::Edge &ea = (*p).first ();
+      const db::Edge &eb = (*p).second ();
+      fprintf (stderr, "VIOPAIR %s A(%.3f,%.3f)-(%.3f,%.3f) B(%.3f,%.3f)-(%.3f,%.3f)\n",
+               r.name.c_str (),
+               ea.p1 ().x () * m_dbu, ea.p1 ().y () * m_dbu, ea.p2 ().x () * m_dbu, ea.p2 ().y () * m_dbu,
+               eb.p1 ().x () * m_dbu, eb.p1 ().y () * m_dbu, eb.p2 ().x () * m_dbu, eb.p2 ().y () * m_dbu);
+    }
+    nb = 0;
     for (db::Region::const_iterator vp = errpoly.begin (); ! vp.at_end () && nb < 5; ++vp, ++nb) {
       db::Box bx = (*vp).box ();
       fprintf (stderr, "VIOBBOX %s %.3f %.3f %.3f %.3f\n", r.name.c_str (),
