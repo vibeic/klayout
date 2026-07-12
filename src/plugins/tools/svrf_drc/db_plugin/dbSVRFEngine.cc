@@ -711,8 +711,20 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d)
         res = negate ? a.selected_not_inside (b) : a.selected_inside (b);
       } else if (op == "OUTSIDE") {
         res = negate ? a.selected_not_outside (b) : a.selected_outside (b);
+      } else if (op == "CUT") {
+        //  Calibre CUT A B: polygons of A that STRADDLE B's boundary — they
+        //  share 2D area with B (part INSIDE B) yet are NOT wholly inside B
+        //  (part OUTSIDE B). This is NOT "every A that interacts B": a pact
+        //  wholly inside its (merged, full-die-width) nwell rail — i.e. every
+        //  PMOS p+ active — interacts nw but does NOT cut it. Mapping CUT onto
+        //  selected_interacting flagged every such pact as a false straddle
+        //  (commercial-PDK a poly-active spacing rule x309 / a poly-active spacing rule x11). Overlapping (area,
+        //  not mere edge-touch) minus wholly-inside == the true straddle set,
+        //  which is EMPTY for a foundry-clean cell.
+        db::Region cut = a.selected_overlapping (b).selected_not_inside (b);
+        res = negate ? (a - cut) : cut;
       } else {
-        //  INTERACT / CUT / TOUCH / ENCLOSE all map to interacting in the reference.
+        //  INTERACT / TOUCH / ENCLOSE all map to interacting in the reference.
         //  SVRF interaction-count qualifier (INTERACT A B ==N / >N / <N): fold
         //  the compiler's count params into KLayout's counted overload; strict
         //  integral bounds shift by one (>N -> min N+1, <N -> max N-1).
@@ -856,7 +868,28 @@ db::EdgesCheckOptions SVRFEngine::edge_check_options (const SVRFRule &r) const
 //  at an angle stay (that is what ABUT<n / ignore_angle governs).
 //  On the commercial-PDK full-FEOL spm GDS this phantom class alone accounted for
 //  the per-cell-count families (imp enclosure x1069, NPSD/PPSD waves, ...).
-static db::EdgePairs drop_coincident_pairs (const db::EdgePairs &ep)
+//  Projection overlap of two PARALLEL edges along a's direction, in
+//  (unnormalized but internally consistent) projected scalar units. Only the
+//  SIGN is used, so the direction magnitude is irrelevant. >0 => the two edges
+//  face each other over a real interval (a 2D error REGION can form between
+//  them); <=0 => they meet only at a corner point (zero overlap) or are fully
+//  offset — no facing region forms.
+static long long parallel_proj_overlap (const db::Edge &a, const db::Edge &b)
+{
+  long long dx = a.dx (), dy = a.dy ();
+  if (dx == 0 && dy == 0) {
+    return -1;                        //  degenerate edge — treat as no overlap
+  }
+  long long a1 = (long long) a.p1 ().x () * dx + (long long) a.p1 ().y () * dy;
+  long long a2 = (long long) a.p2 ().x () * dx + (long long) a.p2 ().y () * dy;
+  long long b1 = (long long) b.p1 ().x () * dx + (long long) b.p1 ().y () * dy;
+  long long b2 = (long long) b.p2 ().x () * dx + (long long) b.p2 ().y () * dy;
+  long long amin = std::min (a1, a2), amax = std::max (a1, a2);
+  long long bmin = std::min (b1, b2), bmax = std::max (b1, b2);
+  return std::min (amax, bmax) - std::max (amin, bmin);
+}
+
+static db::EdgePairs drop_coincident_pairs (const db::EdgePairs &ep, bool region_out)
 {
   db::EdgePairs out;
   for (auto p = ep.begin (); ! p.at_end (); ++p) {
@@ -866,6 +899,17 @@ static db::EdgePairs drop_coincident_pairs (const db::EdgePairs &ep)
                      - (long long) a.dy () * (long long) b.dx ()) == 0;
     if (parallel && a.intersect (b)) {
       continue;                       //  flush/coincident touching — legal
+    }
+    //  Calibre EXT/INT/ENC "... REGION" reports a violation only where a 2D
+    //  error REGION forms between two FACING (projection-overlapping) edges.
+    //  Two PARALLEL edges that meet only at a corner (zero projection overlap)
+    //  — the ubiquitous active/well/implant staircase-interface jog of an
+    //  abutting foundry cell — form no such region, yet KLayout's Euclidian
+    //  separation_check still reports the corner-to-corner distance. Drop those
+    //  for REGION rules ONLY. A genuine facing-edge spacing violation always
+    //  has projection overlap > 0, so this can never mask a real gap.
+    if (region_out && parallel && parallel_proj_overlap (a, b) <= 0) {
+      continue;
     }
     out.insert (*p);
   }
@@ -930,7 +974,7 @@ void SVRFEngine::exec_edge_rule (const SVRFRule &r)
     m_results.push_back (res);
     return;
   }
-  ep = drop_coincident_pairs (ep);
+  ep = drop_coincident_pairs (ep, r.region_out);
   size_t cnt = ep.count ();
   db::Region errpoly;
   ep.polygons (errpoly);
@@ -1163,7 +1207,7 @@ void SVRFEngine::exec_rule (const SVRFRule &r)
     return;
   }
   if (have_ep) {
-    ep = drop_coincident_pairs (ep);
+    ep = drop_coincident_pairs (ep, r.region_out);
     viol.clear ();
     ep.polygons (viol);
   }
