@@ -1028,8 +1028,20 @@ void SVRFEngine::exec_density (const SVRFRule &r)
   if (! r.layer2.empty ()) {
     reg = reg | resolve (r.layer2);
   }
-  db::Box bb = reg.bbox ();
-  if (bb.empty ()) {
+  //  A DENSITY check's denominator is the DESIGN, not the measured layer's own
+  //  footprint: "no WINDOW" (or an "INSIDE OF LAYER <container>" clause, which
+  //  this parser doesn't specially recognize -- e.g. a foundry's SUB=EXTENT
+  //  idiom) means "across the whole chip", exactly what the nullary EXTENT
+  //  derivation already computes (m_layout.cell(m_top).bbox(), see the
+  //  "layout_extent" case above). Using reg.bbox() here instead made a SPARSE
+  //  layer's own tiny local footprint look artificially dense -- e.g. 2 small
+  //  vias placed near each other read as ~93% "density" against their own
+  //  0.15um^2 bounding box, firing a 10%-max-density rule the true chip-wide
+  //  reading (0.0014%) never comes close to -- and was PLACEMENT-dependent:
+  //  the identical total via area at two different locations verified FAIL
+  //  then PASS purely from how tightly the shapes happened to cluster.
+  db::Box extent = m_layout.cell (m_top).bbox ();
+  if (extent.empty ()) {
     SVRFResult res; res.rule = &r; res.verdict = "PASS"; res.info = "0";
     m_results.push_back (res);
     return;
@@ -1048,17 +1060,17 @@ void SVRFEngine::exec_density (const SVRFRule &r)
   std::vector<db::Box> windows;
   db::Coord W = r.has_window ? to_dbu (r.window) : 0;
   if (W <= 0) {
-    windows.push_back (bb);
+    windows.push_back (extent);
   } else {
     db::Coord s = r.has_step ? to_dbu (r.step) : W;
     if (s <= 0) {
       s = W;
     }
-    while (((long long) (bb.width () / s) + 1) * ((long long) (bb.height () / s) + 1) > 20000) {
+    while (((long long) (extent.width () / s) + 1) * ((long long) (extent.height () / s) + 1) > 20000) {
       s *= 2;
     }
-    for (db::Coord y = bb.bottom (); y < bb.top (); y += s) {
-      for (db::Coord x = bb.left (); x < bb.right (); x += s) {
+    for (db::Coord y = extent.bottom (); y < extent.top (); y += s) {
+      for (db::Coord x = extent.left (); x < extent.right (); x += s) {
         windows.push_back (db::Box (x, y, x + W, y + W));
       }
     }
