@@ -468,40 +468,6 @@ const std::vector<SVRFResult> &SVRFEngine::execute ()
 //  parallel measurement-rule phase
 // ---------------------------------------------------------------------------
 
-void SVRFEngine::prewarm_for_parallel (const std::vector<std::pair<const SVRFRule *, std::size_t> > &par)
-{
-  //  1) resolve every parallel-rule input on the MAIN thread and pre-create every
-  //     error-layer output slot, so that during the worker phase std::map is only
-  //     READ / assigned-in-place -- never structurally mutated (which would race).
-  //  2) force each input region's lazy caches (merged polygons + bbox) valid on the
-  //     main thread. db::Region checks read those through `mutable` caches; the
-  //     FIRST touch fills them. Worker copies inherit the valid flags (FlatRegion /
-  //     AsIfFlatRegion copy ctors propagate m_merged_polygons_valid / m_bbox_valid
-  //     and share the filled Shapes copy-on-write), so no worker ever writes shared
-  //     state. (Note: db::Region::merged() builds a fresh region WITHOUT setting the
-  //     source's m_merged_polygons_valid -- begin_merged() is the primitive that
-  //     actually warms the in-place cache the checks consult, so we use it here.)
-  std::set<std::string> warm;
-  for (std::vector<std::pair<const SVRFRule *, std::size_t> >::const_iterator p = par.begin (); p != par.end (); ++p) {
-    const SVRFRule &r = *p->first;
-    m_regions[r.name];                            // pre-create the error-layer slot
-    if (! r.layer1.empty ()) { resolve (r.layer1); warm.insert (r.layer1); }
-    if (! r.layer2.empty ()) { resolve (r.layer2); warm.insert (r.layer2); }
-  }
-  for (std::set<std::string>::const_iterator w = warm.begin (); w != warm.end (); ++w) {
-    std::map<std::string, db::Region>::iterator it = m_regions.find (*w);
-    if (it != m_regions.end ()) {
-      db::Region &reg = it->second;
-      { db::RegionIterator mi = reg.begin_merged (); (void) mi; }   // fill merged cache
-      reg.bbox ();                                                  // fill bbox cache
-    }
-    //  edge-typed operands live in m_edges_ns; as_edges() returns them BY VALUE
-    //  (a copy-on-write copy), so workers never touch the stored Edges in place --
-    //  no warm needed there. A region operand consumed as edges goes through
-    //  resolve(name).edges(), which reads the region's merged cache warmed above.
-  }
-}
-
 namespace
 {
 
@@ -518,6 +484,90 @@ public:
 
 }
 
+void SVRFEngine::prewarm_for_parallel (const std::vector<std::pair<const SVRFRule *, std::size_t> > &par)
+{
+  //  1) resolve every parallel-rule input on the MAIN thread and pre-create every
+  //     error-layer output slot, so that during the worker phase std::map is only
+  //     READ / assigned-in-place -- never structurally mutated (which would race).
+  //  2) force each input region's lazy caches (merged polygons + bbox) valid on the
+  //     main thread. db::Region checks read those through `mutable` caches; the
+  //     FIRST touch fills them. Worker copies inherit the valid flags (FlatRegion /
+  //     AsIfFlatRegion copy ctors propagate m_merged_polygons_valid / m_bbox_valid
+  //     and share the filled Shapes copy-on-write), so no worker ever writes shared
+  //     state. (Note: db::Region::merged() builds a fresh region WITHOUT setting the
+  //     source's m_merged_polygons_valid -- begin_merged() is the primitive that
+  //     actually warms the in-place cache the checks consult, so we use it here.)
+  std::set<std::string> warm_set;
+  std::set<std::string> tiled_ops;                // operands consumed by a tiled family
+  for (std::vector<std::pair<const SVRFRule *, std::size_t> >::const_iterator p = par.begin (); p != par.end (); ++p) {
+    const SVRFRule &r = *p->first;
+    m_regions[r.name];                            // pre-create the error-layer slot
+    if (! r.layer1.empty ()) { resolve (r.layer1); warm_set.insert (r.layer1); }
+    if (! r.layer2.empty ()) { resolve (r.layer2); warm_set.insert (r.layer2); }
+    if (tileable (r)) {
+      if (! r.layer1.empty ()) { tiled_ops.insert (r.layer1); }
+      if (! r.layer2.empty ()) { tiled_ops.insert (r.layer2); }
+    }
+  }
+
+  //  3) Route B, Phase 2 (Goal 1 -- kill the serial-merge bottleneck): each
+  //     distinct operand's merge is INDEPENDENT of every other, so warm them in
+  //     PARALLEL across the worker pool instead of one after another. This was the
+  //     dominant serial cost on a multi-million-shape design (the >1000 finite-reach
+  //     rules share a handful of big metal operands; each is merged exactly once
+  //     here). Filling a DISTINCT region's mutable merged/bbox cache touches only
+  //     that region's own state -- m_regions is only READ (find) concurrently and
+  //     never structurally mutated -- so this is race-free and byte-identical (the
+  //     merge result is deterministic regardless of which thread computes it).
+  std::vector<std::string> warm (warm_set.begin (), warm_set.end ());
+  const std::size_t nwarm = warm.size ();
+  auto warm_one = [this, &warm] (std::size_t i) {
+    std::map<std::string, db::Region>::iterator it = m_regions.find (warm[i]);
+    if (it != m_regions.end ()) {
+      db::Region &reg = it->second;
+      { db::RegionIterator mi = reg.begin_merged (); (void) mi; }   // fill merged cache
+      reg.bbox ();                                                  // fill bbox cache
+    }
+  };
+  int nw = m_threads;
+  if (nw < 1) { nw = 1; }
+  if ((std::size_t) nw > nwarm) { nw = (int) nwarm; }
+  if (nw <= 1 || nwarm <= 1) {
+    for (std::size_t i = 0; i < nwarm; ++i) { warm_one (i); }
+  } else {
+    std::atomic<std::size_t> next (0);
+    std::vector<std::unique_ptr<SVRFFnThread> > workers;
+    workers.reserve ((std::size_t) nw);
+    for (int t = 0; t < nw; ++t) {
+      SVRFFnThread *w = new SVRFFnThread ();
+      w->fn = [&warm_one, &next, nwarm] () {
+        for (;;) {
+          std::size_t i = next.fetch_add (1, std::memory_order_relaxed);
+          if (i >= nwarm) { break; }
+          warm_one (i);
+        }
+      };
+      workers.push_back (std::unique_ptr<SVRFFnThread> (w));
+    }
+    for (int t = 0; t < nw; ++t) { workers[t]->start (); }
+    for (int t = 0; t < nw; ++t) { workers[t]->wait (); }
+  }
+
+  //  4) Prefill the merged-operand cache (Goal 1 memoization) for the operands the
+  //     TILED families actually consume. Now that each operand's in-place merged
+  //     cache is warm, merged_operand() materializes the merged Region once per
+  //     distinct operand, so the tiled checks NEVER re-merge and only ever HIT this
+  //     cache during the worker phase (no worker-thread map insert -> no race).
+  //     Done single-threaded on the main thread.
+  for (std::set<std::string>::const_iterator t = tiled_ops.begin (); t != tiled_ops.end (); ++t) {
+    merged_operand (*t);
+  }
+  //    edge-typed operands live in m_edges_ns; as_edges() returns them BY VALUE
+  //    (a copy-on-write copy), so workers never touch the stored Edges in place --
+  //    no warm needed there. A region operand consumed as edges goes through
+  //    resolve(name).edges(), which reads the region's merged cache warmed above.
+}
+
 void SVRFEngine::run_parallel (const std::vector<std::pair<const SVRFRule *, std::size_t> > &par)
 {
   int nw = m_threads;
@@ -529,6 +579,11 @@ void SVRFEngine::run_parallel (const std::vector<std::pair<const SVRFRule *, std
   }
   const std::size_t n = par.size ();
   std::atomic<std::size_t> next (0);
+
+  //  Publish the rule-level pool WIDTH so a tiled check nested in exec_rule sizes
+  //  its own tile-thread pool to m_threads/width and never oversubscribes past
+  //  m_threads total. Written before the workers start (happens-before via start()).
+  m_rule_pool_width = nw;
 
   std::vector<std::unique_ptr<SVRFFnThread> > workers;
   workers.reserve ((std::size_t) nw);
@@ -553,6 +608,7 @@ void SVRFEngine::run_parallel (const std::vector<std::pair<const SVRFRule *, std
   for (int t = 0; t < nw; ++t) {
     workers[t]->wait ();                           // join: happens-before for pass 3
   }
+  m_rule_pool_width = 0;                            // back on the main thread
 }
 
 // ---------------------------------------------------------------------------
@@ -2022,13 +2078,26 @@ void SVRFEngine::exec_density (const SVRFRule &r, std::size_t slot)
 //  collapses the duplicates to precisely the flat set.
 // ---------------------------------------------------------------------------
 
-bool SVRFEngine::tiled_space_enabled (const SVRFRule &r) const
+bool SVRFEngine::tileable (const SVRFRule &r) const
 {
-  if (r.op != "EXTERNAL") {
-    return false;                                   // Phase 1: space / separation only
+  //  finite-reach families only (worst-case interaction bounded by the rule value
+  //  d): EXTERNAL space/separation, INTERNAL 1-layer width, NOTCH, 2-layer
+  //  ENCLOSURE. DENSITY / connectivity / net-aware checks have unbounded reach and
+  //  stay on the serial flat path.
+  bool family;
+  if (r.op == "EXTERNAL") {
+    family = (r.connectivity == SVRFConnectivity::none);   // net-aware stays serial
+  } else if (r.op == "INTERNAL") {
+    family = r.layer2.empty ();          // width (1-layer); 2-layer overlap stays flat
+  } else if (r.op == "NOTCH") {
+    family = true;
+  } else if (r.op == "ENCLOSURE") {
+    family = ! r.layer2.empty ();        // needs the enclosing (outer) layer
+  } else {
+    family = false;
   }
-  if (r.connectivity != SVRFConnectivity::none) {
-    return false;                                   // net-aware checks stay on the serial path
+  if (! family) {
+    return false;
   }
   if (const char *env = getenv ("SVRFDRC_TILE_SPACE")) {
     return atoi (env) > 0;                           // explicit N>0 enables, 0 disables
@@ -2036,25 +2105,84 @@ bool SVRFEngine::tiled_space_enabled (const SVRFRule &r) const
   return m_threads > 1;                              // default: follow --threads
 }
 
-db::EdgePairs
-SVRFEngine::tiled_external_check (db::Region &l1, const db::Region *l2,
-                                  db::Coord d, const db::RegionCheckOptions &o) const
+const db::Region &
+SVRFEngine::merged_operand (const std::string &name)
 {
-  const bool two_layer = (l2 != 0);
+  {
+    tl::MutexLocker lock (&m_merged_ops_mutex);
+    std::map<std::string, db::Region>::iterator it = m_merged_ops.find (name);
+    if (it != m_merged_ops.end ()) {
+      return it->second;                 // already merged -> reuse (never recompute)
+    }
+  }
+  //  Merge OUTSIDE the lock: distinct operands merge in PARALLEL and only the tiny
+  //  map insert is serialized. resolve(name) is a cache hit here (prewarm resolved
+  //  every parallel-rule operand on the main thread), so no structural mutation of
+  //  m_regions races; and when prewarm warmed that region's merged cache, .merged()
+  //  is a cheap copy-on-write of the already-merged shapes. If two threads race the
+  //  SAME name they both produce the byte-identical merge and the first insert wins.
+  db::Region merged = resolve (name).merged ();
+  { db::RegionIterator wi = merged.begin_merged (); (void) wi; }   // warm merged cache
+  merged.bbox ();                                                  // warm bbox cache
+  tl::MutexLocker lock (&m_merged_ops_mutex);
+  std::map<std::string, db::Region>::iterator it = m_merged_ops.find (name);
+  if (it != m_merged_ops.end ()) {
+    return it->second;
+  }
+  db::Region &slot = m_merged_ops[name];
+  slot = merged;
+  return slot;
+}
 
-  //  (1) merge the operands ONCE (single-threaded). The flat check merges its
-  //  inputs internally, so this changes nothing about the RESULT -- but it makes
-  //  the tiling unit the WHOLE flat polygon, so selected_interacting hands each
-  //  tile a complete polygon (never a halo-cut fragment). merged() materializes a
-  //  flat region; prewarming bbox/merged caches lets the tile workers only READ.
-  db::Region l1m = l1.merged ();
-  db::Region l2m;
-  l1m.bbox (); { db::RegionIterator wi = l1m.begin_merged (); (void) wi; }
-  db::Box bb = l1m.bbox ();
+db::EdgePairs
+SVRFEngine::tiled_check (TiledKind kind, const db::Region &pa, const db::Region *pb,
+                         db::Coord d, const db::RegionCheckOptions &o) const
+{
+  const bool two_layer = (pb != 0);
+
+  //  per-tile flat check: run the IDENTICAL flat family check on a sub-region.
+  //  pa/pb are ALREADY merged (merged_operand), so the check merges nothing
+  //  further -> every tile that contains a violation computes the byte-identical
+  //  edge pair. For 2-layer families pa is the check's PRIMARY operand (l1 for
+  //  separation, the OUTER/enclosing layer for enclosure) and pb the secondary.
+  auto flat_of = [&] (const db::Region &a, const db::Region *b) -> db::EdgePairs {
+    switch (kind) {
+      case TK_SPACE:      return a.space_check (d, o);
+      case TK_SEPARATION: return a.separation_check (*b, d, o);
+      case TK_WIDTH:      return a.width_check (d, o);
+      case TK_NOTCH:      return a.notch_check (d, o);
+      case TK_ENCLOSURE:  return a.enclosing_check (*b, d, o);
+    }
+    return db::EdgePairs ();
+  };
+
+  //  (0) tile-thread budget. Never oversubscribe past m_threads when nested under
+  //  the rule-level worker pool: use m_threads/rule_pool_width tile threads. When
+  //  running on the MAIN thread (rule_pool_width==0) use all m_threads -- that is
+  //  the single-dominant-rule case spatial tiling exists FOR. When the rule-level
+  //  pool already saturates the cores this resolves to 1 tile thread, and (unless
+  //  a grid was force-requested) we skip tiling entirely and run the plain flat
+  //  check on the merged operands: same byte-identical result, none of the
+  //  per-tile halo-select overhead that would otherwise erode the rule-level gain.
+  int pool = (m_rule_pool_width > 0 ? m_rule_pool_width : 1);
+  int nw = (m_threads > 0 ? m_threads : 1) / pool;
+  if (nw < 1) {
+    nw = 1;
+  }
+  bool forced = false;
+  int per = 0;
+  if (const char *env = getenv ("SVRFDRC_TILE_SPACE")) {
+    per = atoi (env);
+    forced = (per > 0);
+  }
+  if (nw <= 1 && ! forced) {
+    return flat_of (pa, pb);             // auto-flat: no parallelism to gain
+  }
+
+  //  (1) bbox of the already-merged operands.
+  db::Box bb = pa.bbox ();
   if (two_layer) {
-    l2m = l2->merged ();
-    l2m.bbox (); { db::RegionIterator wi = l2m.begin_merged (); (void) wi; }
-    bb += l2m.bbox ();
+    bb += pb->bbox ();
   }
   if (bb.empty ()) {
     return db::EdgePairs ();
@@ -2077,13 +2205,8 @@ SVRFEngine::tiled_external_check (db::Region &l1, const db::Region *l2,
   //  the exact dedup the grid NEVER changes the result (only the work split), so
   //  any covering grid is byte-identical -- we only need every violation's location
   //  to land in some core. per-axis: SVRFDRC_TILE_SPACE=N forces N (stress test),
-  //  else auto ~ sqrt(threads).
-  bool forced = false;
-  int per = 0;
-  if (const char *env = getenv ("SVRFDRC_TILE_SPACE")) {
-    per = atoi (env);
-    forced = (per > 0);
-  }
+  //  else auto ~ sqrt(threads). (`per`/`forced` were resolved with the thread
+  //  budget above.)
   if (per <= 0) {
     per = (int) std::ceil (std::sqrt ((double) std::max (1, m_threads)));
   }
@@ -2127,22 +2250,20 @@ SVRFEngine::tiled_external_check (db::Region &l1, const db::Region *l2,
   auto do_tile = [&] (std::size_t i) {
     db::Region hb;
     hb.insert (cores[i].enlarged (bvec));
-    db::Region a = l1m.selected_interacting (hb);
+    db::Region a = pa.selected_interacting (hb);
     if (a.empty ()) {
-      return;                                        // nothing of l1 near this core
+      return;                                        // nothing of the primary near this core
     }
     if (two_layer) {
-      db::Region b = l2m.selected_interacting (hb);
-      per_tile[i] = a.separation_check (b, d, o);
+      db::Region b = pb->selected_interacting (hb);
+      per_tile[i] = flat_of (a, &b);
     } else {
-      per_tile[i] = a.space_check (d, o);
+      per_tile[i] = flat_of (a, 0);
     }
   };
 
-  int nw = m_threads;
-  if (nw < 1) {
-    nw = 1;
-  }
+  //  nw (tile-thread count) was resolved from the m_threads/rule_pool_width budget
+  //  at the top; clamp it to the number of tiles actually produced.
   if ((std::size_t) nw > ntiles) {
     nw = (int) ntiles;
   }
@@ -2320,15 +2441,20 @@ void SVRFEngine::exec_rule (const SVRFRule &r, std::size_t slot)
       have_ep = false;
     } else {
       db::Region l1 = resolve (r.layer1);
+      //  Route B: for every finite-reach family, tileable(r) engages the
+      //  byte-identical spatial-tiling parallel path (which auto-falls-back to the
+      //  plain flat check when tiling would not add parallelism). The operands go
+      //  in ALREADY-MERGED (merged_operand -> each distinct operand merged once).
+      const bool tile = tileable (r);
       if (r.op == "EXTERNAL") {
         db::RegionCheckOptions o = check_options (r);
-        if (tiled_space_enabled (r)) {
-          //  Route B, Phase 1: byte-identical spatial-tiling parallel path.
+        if (tile) {
+          const db::Region &pa = merged_operand (r.layer1);
           if (r.layer2.empty ()) {
-            ep = tiled_external_check (l1, 0, d, o);
+            ep = tiled_check (TK_SPACE, pa, 0, d, o);
           } else {
-            db::Region l2 = resolve (r.layer2);
-            ep = tiled_external_check (l1, &l2, d, o);
+            const db::Region &pb = merged_operand (r.layer2);
+            ep = tiled_check (TK_SEPARATION, pa, &pb, d, o);
           }
         } else {
           ep = r.layer2.empty () ? l1.space_check (d, o) : l1.separation_check (resolve (r.layer2), d, o);
@@ -2336,17 +2462,30 @@ void SVRFEngine::exec_rule (const SVRFRule &r, std::size_t slot)
         have_ep = true;
       } else if (r.op == "INTERNAL") {
         if (r.layer2.empty ()) {
-          ep = l1.width_check (d, check_options (r, false));
+          db::RegionCheckOptions o = check_options (r, false);
+          ep = tile ? tiled_check (TK_WIDTH, merged_operand (r.layer1), 0, d, o)
+                    : l1.width_check (d, o);
         } else {
-          ep = l1.overlap_check (resolve (r.layer2), d, check_options (r));
+          ep = l1.overlap_check (resolve (r.layer2), d, check_options (r));   // 2-layer: flat
         }
         have_ep = true;
       } else if (r.op == "NOTCH") {
-        ep = l1.notch_check (d, check_options (r, false));
+        db::RegionCheckOptions o = check_options (r, false);
+        ep = tile ? tiled_check (TK_NOTCH, merged_operand (r.layer1), 0, d, o)
+                  : l1.notch_check (d, o);
         have_ep = true;
       } else if (r.op == "ENCLOSURE") {
-        db::Region outer = r.layer2.empty () ? db::Region () : resolve (r.layer2);
-        ep = outer.enclosing_check (l1, d, check_options (r));
+        db::RegionCheckOptions o = check_options (r);
+        if (tile) {
+          //  flat is outer.enclosing_check(l1): primary = outer (layer2),
+          //  secondary = the enclosed layer1.
+          const db::Region &outer = merged_operand (r.layer2);
+          const db::Region &inner = merged_operand (r.layer1);
+          ep = tiled_check (TK_ENCLOSURE, outer, &inner, d, o);
+        } else {
+          db::Region outer = r.layer2.empty () ? db::Region () : resolve (r.layer2);
+          ep = outer.enclosing_check (l1, d, o);
+        }
         have_ep = true;
       } else {
         SVRFResult res; res.rule = &r; res.verdict = "SKIP";

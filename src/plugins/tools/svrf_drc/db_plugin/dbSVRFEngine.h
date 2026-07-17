@@ -42,6 +42,8 @@
 #include "dbEdgePairs.h"
 #include "dbLayoutToNetlist.h"
 
+#include "tlThreads.h"
+
 #include <string>
 #include <vector>
 #include <map>
@@ -132,6 +134,19 @@ private:
   std::vector<SVRFResult> m_results;
   int m_threads = 1;                 // worker count for the parallel rule phase
 
+  //  -- Route B, Phase 2: merged-operand memoization + tile-thread budget --
+  //  Each distinct finite-reach check operand is merged EXACTLY ONCE and reused
+  //  across every rule that reads it. Guarded by a mutex so the parallel prewarm
+  //  and rule phases fill it race-free.
+  std::map<std::string, db::Region> m_merged_ops;
+  tl::Mutex m_merged_ops_mutex;
+  //  Width of the CURRENTLY-active rule-level worker pool (0 = running on the main
+  //  thread). A tiled check sizes its own tile-thread pool to m_threads/width so
+  //  the two nesting levels never oversubscribe past m_threads total. Written on
+  //  the main thread before the pool starts / after it joins (happens-before the
+  //  worker reads), read by the tiled checks -> no concurrent write during reads.
+  int m_rule_pool_width = 0;
+
   //  -- cell-aware FEOL exemption state (fork fix #2) ----------------------
   //  Built ONCE by setup_cell_aware_feol() at the head of execute() and only
   //  READ during the (possibly parallel) rule phase -> safe to share across
@@ -200,21 +215,40 @@ private:
   bool inputs_unmodeled (const SVRFRule &r) const;
   bool is_edge_rule (const SVRFRule &r) const;
 
-  //  -- Route B, Phase 1: spatial tiling of finite-reach EXTERNAL checks ----
-  //  gate: engage the tiled space/separation path (op EXTERNAL, non-connectivity)
-  //  when --threads>1 (or SVRFDRC_TILE_SPACE=N>0 forces N tiles/axis; =0 disables).
-  bool tiled_space_enabled (const SVRFRule &r) const;
-  //  Byte-identical parallel space_check/separation_check by spatial tiles. The
-  //  operands are merged ONCE (single-threaded) so the tiling unit is the WHOLE
-  //  flat polygon; each tile collects the whole polygons within `border` (the
-  //  rule's finite reach) of its core via selected_interacting -- never a cut
-  //  fragment -- and runs the IDENTICAL flat check on that sub-region. Every tile
-  //  that sees both operands of a violation therefore computes the byte-identical
-  //  edge pair, and an EXACT-geometric dedup at merge collapses those duplicates
-  //  to exactly the flat edge-pair set. Result (and hence the report COUNT) is
-  //  independent of grid and thread count -> byte-identical to the flat path.
-  db::EdgePairs tiled_external_check (db::Region &l1, const db::Region *l2,
-                                      db::Coord d, const db::RegionCheckOptions &o) const;
+  //  -- Route B: spatial tiling of the finite-reach check families ---------
+  //  Phase 2 generalizes Phase 1's EXTERNAL space/separation tiler to EVERY
+  //  finite-reach family whose worst-case interaction is bounded by the rule
+  //  value d: EXTERNAL (space / separation), INTERNAL 1-layer (width), NOTCH,
+  //  and ENCLOSURE. DENSITY / connectivity / net checks (unbounded reach) stay
+  //  on the serial flat path.
+  enum TiledKind { TK_SPACE, TK_SEPARATION, TK_WIDTH, TK_NOTCH, TK_ENCLOSURE };
+  //  gate: engage the tiled path for a finite-reach family when --threads>1
+  //  (or SVRFDRC_TILE_SPACE=N>0 forces N tiles/axis; =0 disables).
+  bool tileable (const SVRFRule &r) const;
+  //  Thread-safe memoized merge of a named operand (Phase 2, Goal 1). The deck
+  //  runs >1000 finite-reach rules that share a handful of metal operands; this
+  //  merges each distinct operand EXACTLY ONCE and hands every rule that reads it
+  //  a stable reference to the same merged Region -- byte-identical to
+  //  resolve(name).merged(), but never recomputed. A std::map never invalidates
+  //  references to existing nodes on insert, so the returned reference stays valid
+  //  as other operands are inserted concurrently.
+  const db::Region &merged_operand (const std::string &name);
+  //  Byte-identical spatially-tiled check for any finite-reach family. `pa`/`pb`
+  //  are the already-MERGED primary/secondary operands (pb null for a 1-layer
+  //  family), so the tiling unit is the WHOLE flat polygon; each tile collects
+  //  the whole polygons within `border` (the rule's finite reach) of its core via
+  //  selected_interacting -- never a cut fragment -- and runs the IDENTICAL flat
+  //  check on that sub-region. Every tile that sees both operands of a violation
+  //  therefore computes the byte-identical edge pair, and an EXACT-geometric dedup
+  //  at merge collapses those duplicates to exactly the flat edge-pair set. Result
+  //  (and hence the report COUNT) is independent of grid and thread count ->
+  //  byte-identical to the flat path. The tile-thread pool is sized to
+  //  m_threads/rule_pool_width so it never oversubscribes past m_threads when
+  //  nested under the rule-level worker pool; when that resolves to a single tile
+  //  thread and the grid was not force-requested it runs the plain flat check on
+  //  the merged operands (same result, no per-tile halo-select overhead).
+  db::EdgePairs tiled_check (TiledKind kind, const db::Region &pa, const db::Region *pb,
+                             db::Coord d, const db::RegionCheckOptions &o) const;
 
   //  -- parallel measurement-rule phase -----------------------------------
   //  Single-threaded pre-realization: resolve every parallel-rule input on the
