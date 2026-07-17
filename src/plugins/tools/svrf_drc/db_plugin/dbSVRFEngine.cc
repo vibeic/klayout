@@ -22,18 +22,27 @@
 #include "dbNet.h"
 #include "dbLayerProperties.h"
 #include "dbPropertyConstraint.h"
+#include "dbPolygon.h"
+#include "dbTrans.h"
+#include "dbBox.h"
 
 #include "tlStream.h"
 #include "tlVariant.h"
 #include "tlException.h"
+#include "tlThreads.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <sstream>
+#include <fstream>
 #include <limits>
+#include <atomic>
+#include <functional>
+#include <chrono>
 
 namespace db
 {
@@ -251,23 +260,149 @@ db::Edges SVRFEngine::as_edges (const std::string &name)
 
 const std::vector<SVRFResult> &SVRFEngine::execute ()
 {
-  //  pass 1: derivations + measurement rules (build every layer incl. error
-  //  layers). COPY is deferred to pass 2 so forward-references still resolve.
-  std::vector<const SVRFRule *> copies;
+  //  --- cell-aware FEOL exemption setup (fork fix #2) --------------------
+  //  No-op (returns immediately, m_feol_enabled stays false) unless a config
+  //  path was set via set_cell_aware_feol(). Runs before any rule so the shared
+  //  footprint index is fully built (and never mutated) during the rule phase.
+  setup_cell_aware_feol ();
+
+  //  --- result-slot layout (frozen report order) -------------------------
+  //  Report lines are: [ every non-COPY rule in source order ] followed by
+  //  [ every COPY rule in source order ]. Assign each rule a fixed slot in that
+  //  order and pre-size m_results, so every rule writes its own slot and the byte
+  //  order of the report is independent of the execution order (inline vs worker).
+  std::size_t n_noncopy = 0, n_copy = 0;
   for (std::vector<SVRFStatement>::const_iterator s = m_deck.statements.begin (); s != m_deck.statements.end (); ++s) {
-    if (s->kind == SVRFStatement::Derivation) {
-      exec_derivation (m_deck.derivations[s->index]);
-    } else {
-      const SVRFRule &r = m_deck.rules[s->index];
-      if (r.op == "COPY") {
-        copies.push_back (&r);
-      } else {
-        exec_rule (r);
-      }
+    if (s->kind == SVRFStatement::Rule) {
+      (m_deck.rules[s->index].op == "COPY" ? n_copy : n_noncopy) += 1;
     }
   }
-  for (std::vector<const SVRFRule *>::iterator c = copies.begin (); c != copies.end (); ++c) {
-    exec_rule (**c);
+  m_results.assign (n_noncopy + n_copy, SVRFResult ());
+
+  //  --- reorder-safety map -----------------------------------------------
+  //  A non-COPY measurement rule may only be deferred to the parallel phase if
+  //  NO derivation LATER in source order consumes its output layer -- otherwise
+  //  that later derivation must observe the rule's real error layer exactly as in
+  //  the serial interleaving (the parser proved rules never consume other rule
+  //  outputs, so a derivation is the only possible downstream consumer). Record,
+  //  per referenced name, the highest statement index at which a derivation
+  //  references it.
+  //  Also count how many rules share each output name: a non-unique name would
+  //  make two rules write the SAME m_regions[name] error layer, so such rules stay
+  //  serial (preserving the source-order last-writer-wins) rather than racing.
+  //  (Rule names are unique in the commercial-PDK deck, so this excludes nothing there --
+  //  it is a correctness guard for arbitrary decks.)
+  std::map<std::string, int> name_count;
+  for (std::vector<SVRFRule>::const_iterator rr = m_deck.rules.begin (); rr != m_deck.rules.end (); ++rr) {
+    if (rr->op != "COPY") {
+      name_count[rr->name] += 1;
+    }
+  }
+
+  std::map<std::string, std::size_t> last_deriv_ref;
+  for (std::size_t i = 0; i < m_deck.statements.size (); ++i) {
+    const SVRFStatement &st = m_deck.statements[i];
+    if (st.kind != SVRFStatement::Derivation) {
+      continue;
+    }
+    const SVRFDerivation &d = m_deck.derivations[st.index];
+    std::set<std::string> refs (d.operands.begin (), d.operands.end ());
+    {
+      //  tokenize the boolean expr the same way eval_bool_expr does
+      std::string cur;
+      for (std::size_t k = 0; k < d.expr.size (); ++k) {
+        char ch = d.expr[k];
+        if (ch == '(' || ch == ')' || std::isspace ((unsigned char) ch)) {
+          if (! cur.empty ()) { refs.insert (cur); cur.clear (); }
+        } else {
+          cur += ch;
+        }
+      }
+      if (! cur.empty ()) { refs.insert (cur); }
+    }
+    for (std::set<std::string>::const_iterator r = refs.begin (); r != refs.end (); ++r) {
+      last_deriv_ref[*r] = i;                      // i increases -> keeps the max
+    }
+  }
+
+  //  --- pass 1 (serial, source order): derivations + main-thread rules ----
+  //  Derivations build the flat-Region DAG (must stay serial). Rules that are NOT
+  //  safe to parallelize (DENSITY / connectivity / consumed-by-a-later-derivation)
+  //  run inline here, exactly at their source position. The rest are collected for
+  //  the parallel phase; COPY is deferred to pass 3 (unchanged).
+  //  SVRFDRC_TIMING=1: emit per-phase wall-clock to stderr (diagnostic only; does
+  //  NOT touch the report). Lets the speedup be attributed to the parallel phase.
+  const bool timing = (getenv ("SVRFDRC_TIMING") != 0);
+  typedef std::chrono::steady_clock clk;
+  clk::time_point t_pass1 = clk::now ();
+
+  std::vector<std::pair<const SVRFRule *, std::size_t> > parallel;
+  std::vector<std::pair<const SVRFRule *, std::size_t> > copies;
+  std::size_t noncopy_rank = 0, copy_rank = 0;
+  for (std::size_t i = 0; i < m_deck.statements.size (); ++i) {
+    const SVRFStatement &st = m_deck.statements[i];
+    if (st.kind == SVRFStatement::Derivation) {
+      exec_derivation (m_deck.derivations[st.index]);
+      continue;
+    }
+    const SVRFRule &r = m_deck.rules[st.index];
+    if (r.op == "COPY") {
+      std::size_t slot = n_noncopy + copy_rank;
+      copy_rank += 1;
+      copies.push_back (std::make_pair (&r, slot));
+      continue;
+    }
+    std::size_t slot = noncopy_rank;
+    noncopy_rank += 1;
+    std::map<std::string, std::size_t>::const_iterator ld = last_deriv_ref.find (r.name);
+    bool consumed_later = (ld != last_deriv_ref.end () && ld->second > i);
+    bool dup_name = (name_count[r.name] > 1);
+    bool main_thread = (m_threads <= 1) ||
+                       consumed_later ||
+                       dup_name ||
+                       (r.op == "DENSITY") ||
+                       (r.connectivity != SVRFConnectivity::none);
+    if (main_thread) {
+      exec_rule (r, slot);                         // inline, at source position
+    } else {
+      parallel.push_back (std::make_pair (&r, slot));
+    }
+  }
+
+  clk::time_point t_pass2 = clk::now ();
+  if (timing) {
+    fprintf (stderr, "SVRFDRC_TIMING [live] pass1 (derivations + serial rules) done: %lldms  (%zu parallel rules pending)\n",
+             (long long) std::chrono::duration_cast<std::chrono::milliseconds> (t_pass2 - t_pass1).count (), parallel.size ());
+  }
+
+  //  --- pass 2 (parallel): the independent measurement rules --------------
+  clk::time_point t_warm = t_pass2;
+  if (! parallel.empty ()) {
+    prewarm_for_parallel (parallel);               // single-threaded realization
+    t_warm = clk::now ();
+    if (timing) {
+      fprintf (stderr, "SVRFDRC_TIMING [live] prewarm (serial merge/bbox realize) done: %lldms\n",
+               (long long) std::chrono::duration_cast<std::chrono::milliseconds> (t_warm - t_pass2).count ());
+    }
+    run_parallel (parallel);                       // worker pool; joins before pass 3
+  }
+  clk::time_point t_pass3 = clk::now ();
+
+  //  --- pass 3 (serial): COPY, after every error layer exists -------------
+  for (std::vector<std::pair<const SVRFRule *, std::size_t> >::iterator c = copies.begin (); c != copies.end (); ++c) {
+    exec_rule (*c->first, c->second);
+  }
+  if (timing) {
+    auto ms = [] (clk::time_point a, clk::time_point b) {
+      return std::chrono::duration_cast<std::chrono::milliseconds> (b - a).count ();
+    };
+    fprintf (stderr,
+             "SVRFDRC_TIMING threads=%d  pass1(derivations+serial-rules)=%lldms  "
+             "prewarm=%lldms  parallel-checks=%lldms  pass3(COPY)=%lldms  "
+             "parallel_rules=%zu\n",
+             m_threads, (long long) ms (t_pass1, t_pass2), (long long) ms (t_pass2, t_warm),
+             (long long) ms (t_warm, t_pass3), (long long) ms (t_pass3, clk::now ()),
+             parallel.size ());
   }
   //  SVRFDRC_DUMP_GDS=name1,name2,... : write each named region/edge layer to
   //  dump_layers.gds under the cwd (regions -> layer i/0, edges -> layer i/1
@@ -318,6 +453,432 @@ const std::vector<SVRFResult> &SVRFEngine::execute ()
     }
   }
   return m_results;
+}
+
+// ---------------------------------------------------------------------------
+//  parallel measurement-rule phase
+// ---------------------------------------------------------------------------
+
+void SVRFEngine::prewarm_for_parallel (const std::vector<std::pair<const SVRFRule *, std::size_t> > &par)
+{
+  //  1) resolve every parallel-rule input on the MAIN thread and pre-create every
+  //     error-layer output slot, so that during the worker phase std::map is only
+  //     READ / assigned-in-place -- never structurally mutated (which would race).
+  //  2) force each input region's lazy caches (merged polygons + bbox) valid on the
+  //     main thread. db::Region checks read those through `mutable` caches; the
+  //     FIRST touch fills them. Worker copies inherit the valid flags (FlatRegion /
+  //     AsIfFlatRegion copy ctors propagate m_merged_polygons_valid / m_bbox_valid
+  //     and share the filled Shapes copy-on-write), so no worker ever writes shared
+  //     state. (Note: db::Region::merged() builds a fresh region WITHOUT setting the
+  //     source's m_merged_polygons_valid -- begin_merged() is the primitive that
+  //     actually warms the in-place cache the checks consult, so we use it here.)
+  std::set<std::string> warm;
+  for (std::vector<std::pair<const SVRFRule *, std::size_t> >::const_iterator p = par.begin (); p != par.end (); ++p) {
+    const SVRFRule &r = *p->first;
+    m_regions[r.name];                            // pre-create the error-layer slot
+    if (! r.layer1.empty ()) { resolve (r.layer1); warm.insert (r.layer1); }
+    if (! r.layer2.empty ()) { resolve (r.layer2); warm.insert (r.layer2); }
+  }
+  for (std::set<std::string>::const_iterator w = warm.begin (); w != warm.end (); ++w) {
+    std::map<std::string, db::Region>::iterator it = m_regions.find (*w);
+    if (it != m_regions.end ()) {
+      db::Region &reg = it->second;
+      { db::RegionIterator mi = reg.begin_merged (); (void) mi; }   // fill merged cache
+      reg.bbox ();                                                  // fill bbox cache
+    }
+    //  edge-typed operands live in m_edges_ns; as_edges() returns them BY VALUE
+    //  (a copy-on-write copy), so workers never touch the stored Edges in place --
+    //  no warm needed there. A region operand consumed as edges goes through
+    //  resolve(name).edges(), which reads the region's merged cache warmed above.
+  }
+}
+
+namespace
+{
+
+//  A tl::Thread that runs a stored closure. Used to build a tiny worker pool from
+//  KLayout's native thread primitive (klayout_tl) -- no external -pthread needed by
+//  the parity-test g++ line, and no std::thread.
+class SVRFFnThread
+  : public tl::Thread
+{
+public:
+  std::function<void ()> fn;
+  void run () { if (fn) { fn (); } }
+};
+
+}
+
+void SVRFEngine::run_parallel (const std::vector<std::pair<const SVRFRule *, std::size_t> > &par)
+{
+  int nw = m_threads;
+  if (nw < 1) {
+    nw = 1;
+  }
+  if ((std::size_t) nw > par.size ()) {
+    nw = (int) par.size ();
+  }
+  const std::size_t n = par.size ();
+  std::atomic<std::size_t> next (0);
+
+  std::vector<std::unique_ptr<SVRFFnThread> > workers;
+  workers.reserve ((std::size_t) nw);
+  for (int t = 0; t < nw; ++t) {
+    SVRFFnThread *w = new SVRFFnThread ();
+    //  Dynamic self-scheduling: rules vary in cost by orders of magnitude, so each
+    //  worker grabs the next index atomically rather than taking a static slice.
+    w->fn = [this, &par, &next, n] () {
+      for (;;) {
+        std::size_t i = next.fetch_add (1, std::memory_order_relaxed);
+        if (i >= n) {
+          break;
+        }
+        this->exec_rule (*par[i].first, par[i].second);
+      }
+    };
+    workers.push_back (std::unique_ptr<SVRFFnThread> (w));
+  }
+  for (int t = 0; t < nw; ++t) {
+    workers[t]->start ();
+  }
+  for (int t = 0; t < nw; ++t) {
+    workers[t]->wait ();                           // join: happens-before for pass 3
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  cell-aware FEOL over-fire exemption (fork fix #2, Route B)
+//
+//  On a dense digital design the sign-off deck derives a qualified-cell FEOL
+//  exemption from a SINGLE don't-check marker; routing metal OVER a cell carves
+//  that marker, so a foundry-qualified std-cell's INTERIOR FEOL space/notch --
+//  which passes the deck STANDALONE -- re-fires once flattened into the design.
+//  Those fires are flatten artifacts, not backend defects. This exemption DROPS
+//  exactly (a subset of) those artifacts, and NEVER a real one, using a strictly
+//  geometric discriminator on the EXACT placed cell geometry:
+//
+//    an error edge-pair is exempted IFF its error BRIDGE (the quadrilateral whose
+//    two long sides ARE the two violating edges) is
+//      (1) fully inside EXACTLY ONE placed qualified-master footprint (single
+//          master -- an inter-cell violation straddles a boundary and is NOT
+//          inside any single footprint), AND
+//      (2) at least m_feol_strict dbu clear of that footprint's boundary (STRICT
+//          interior -- an abutment violation sits ON the cell boundary), AND
+//      (3) not touched by ANY top-level (non-cell-interior) FEOL shape (so a real
+//          violation formed with top-level / non-qualified geometry is KEPT).
+//    Anything else -- 0 covers, >=2 covers, a boundary touch, or a top-level
+//    shape -- is KEPT. This is a CONSERVATIVE LOWER BOUND: it can exempt fewer
+//    than the ideal artifact set, but it can never false-clean a real violation.
+//
+//  Footprints come from the qualified-master library GDS (EXACT per-master shape
+//  union, NOT a bbox) placed by the DEF -- mirroring the v1.4.49 host attributor's
+//  inputs, but TIGHTER (per-master exact geometry + single-master + strict-
+//  interior + top-level guard, versus the host's bbox-union upper bound).
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+//  DEF orientation -> (rot90_count, mirror_x). Matches the v1.4.49 attributor's
+//  _DEF_ORIENT (mirror about X-axis BEFORE rotation == db::Trans(rot, mirr, u)).
+bool def_orient (const std::string &o, int &rot, bool &mirr)
+{
+  if (o == "N")  { rot = 0; mirr = false; return true; }
+  if (o == "S")  { rot = 2; mirr = false; return true; }
+  if (o == "E")  { rot = 1; mirr = false; return true; }
+  if (o == "W")  { rot = 3; mirr = false; return true; }
+  if (o == "FN") { rot = 0; mirr = true;  return true; }
+  if (o == "FS") { rot = 2; mirr = true;  return true; }
+  if (o == "FE") { rot = 1; mirr = true;  return true; }
+  if (o == "FW") { rot = 3; mirr = true;  return true; }
+  return false;
+}
+
+}  // namespace
+
+void SVRFEngine::setup_cell_aware_feol ()
+{
+  m_feol_enabled = false;
+  if (m_feol_cfg_path.empty ()) {
+    return;                              // DEFAULT: disabled -> byte-identical report
+  }
+
+  //  --- parse the opt-in config ------------------------------------------
+  std::ifstream cf (m_feol_cfg_path.c_str ());
+  if (! cf) {
+    throw tl::Exception ("cell-aware-feol: cannot open config " + m_feol_cfg_path);
+  }
+  std::string lib_path, def_path;
+  std::set<std::string> qualified;
+  std::string line;
+  while (std::getline (cf, line)) {
+    std::string::size_type h = line.find ('#');
+    if (h != std::string::npos) {
+      line = line.substr (0, h);
+    }
+    std::istringstream ls (line);
+    std::string key;
+    if (! (ls >> key)) {
+      continue;
+    }
+    for (std::string::size_type i = 0; i < key.size (); ++i) {
+      key[i] = (char) std::tolower ((unsigned char) key[i]);
+    }
+    if (key == "lib") {
+      ls >> lib_path;
+    } else if (key == "def") {
+      ls >> def_path;
+    } else if (key == "strict_dbu") {
+      long v = 1;
+      ls >> v;
+      m_feol_strict = (db::Coord) (v < 1 ? 1 : v);
+    } else if (key == "qualified") {
+      std::string t;
+      while (ls >> t) { qualified.insert (t); }
+    } else if (key == "feol_rule") {
+      std::string t;
+      while (ls >> t) { m_feol_rules.insert (t); }
+    } else if (key == "feol_gds") {
+      //  raw FEOL layers as "gds/dt" (dt defaults to 0), e.g. "feol_gds 4/0 5/0"
+      std::string t;
+      while (ls >> t) {
+        std::string::size_type sl = t.find ('/');
+        int gl = 0, dt = 0;
+        std::istringstream gs (sl == std::string::npos ? t : t.substr (0, sl));
+        gs >> gl;
+        if (sl != std::string::npos) {
+          std::istringstream dsx (t.substr (sl + 1));
+          dsx >> dt;
+        }
+        m_feol_gds.push_back (std::make_pair (gl, dt));
+      }
+    }
+  }
+  if (lib_path.empty () || def_path.empty () || qualified.empty () ||
+      m_feol_rules.empty () || m_feol_gds.empty ()) {
+    //  feol_gds is MANDATORY: without the raw FEOL layers the top-level guard
+    //  cannot be built, and without that guard a top-level shard inside a cell
+    //  footprint could be false-cleaned. Refuse rather than exempt unsafely.
+    throw tl::Exception ("cell-aware-feol: config needs 'lib', 'def', 'feol_gds', "
+                         ">=1 'qualified' and >=1 'feol_rule'");
+  }
+
+  //  --- read the master library GDS; build EXACT per-master footprints ----
+  //  Footprint = union of ALL the master's drawn shapes (every layer), merged.
+  //  This is the REAL placed cell geometry (NOT a bbox); on a std-cell the well /
+  //  implant / rails / abutment layers tile the cell so the union covers the
+  //  interior including inter-feature gaps -- exactly the "is this inside the
+  //  cell" predicate we need, while excluding any bbox area the cell doesn't own.
+  db::Layout lib;
+  {
+    tl::InputStream stream (lib_path);
+    db::Reader reader (stream);
+    reader.read (lib);
+  }
+  double lib_dbu = lib.dbu ();
+  double lib_scale = (m_dbu > 0.0 ? lib_dbu / m_dbu : 1.0);   // -> design dbu
+  bool need_scale = (lib_scale > 1.0000001 || lib_scale < 0.9999999);
+
+  //  per-master RAW FEOL geometry (m_feol_gds layers), local coords -- placed
+  //  below into m_feol_qual_feol for the top-level guard. Kept local to setup.
+  std::map<std::string, db::Region> master_feol;
+
+  for (std::set<std::string>::const_iterator q = qualified.begin (); q != qualified.end (); ++q) {
+    std::pair<bool, db::cell_index_type> c = lib.cell_by_name (q->c_str ());
+    if (! c.first) {
+      continue;                          // master absent from lib -> can never attribute -> never exempt
+    }
+    const db::Cell &cell = lib.cell (c.second);
+    //  all-layer footprint (for strict containment)
+    db::Region foot;
+    for (db::Layout::layer_iterator li = lib.begin_layers (); li != lib.end_layers (); ++li) {
+      db::RecursiveShapeIterator si (lib, cell, (*li).first);
+      foot += db::Region (si);            // operator+= (const Region&): exported (insert<Region> is not)
+    }
+    foot.merge ();
+    if (foot.empty ()) {
+      continue;
+    }
+    //  raw FEOL geometry (for the top-level guard)
+    db::Region ff;
+    for (std::vector<std::pair<int, int> >::const_iterator g = m_feol_gds.begin (); g != m_feol_gds.end (); ++g) {
+      unsigned int gi = lib.get_layer (db::LayerProperties (g->first, g->second));
+      db::RecursiveShapeIterator si (lib, cell, gi);
+      ff += db::Region (si);
+    }
+    ff.merge ();
+    if (need_scale) {
+      foot.transform (db::ICplxTrans (lib_scale));
+      if (! ff.empty ()) {
+        ff.transform (db::ICplxTrans (lib_scale));
+      }
+    }
+    db::Region &stored = (m_feol_master[*q] = foot);
+    m_feol_master_strict[*q] = stored.sized (- m_feol_strict);   // may be empty for a tiny cell -> strict fails-safe
+    master_feol[*q] = ff;
+  }
+  if (m_feol_master.empty ()) {
+    throw tl::Exception ("cell-aware-feol: no qualified master found in lib " + lib_path);
+  }
+
+  //  --- parse DEF placements; build the per-instance footprint index ------
+  std::string deftext;
+  {
+    std::ifstream df (def_path.c_str ());
+    if (! df) {
+      throw tl::Exception ("cell-aware-feol: cannot open DEF " + def_path);
+    }
+    std::stringstream ds;
+    ds << df.rdbuf ();
+    deftext = ds.str ();
+  }
+
+  //  DEF database units per micron (default 1000); design coord = def_coord *
+  //  (1/units) / m_dbu. On a same-PDK flow (units=1000, dbu=0.001) this is 1.
+  double def_units = 1000.0;
+  {
+    std::string::size_type u = deftext.find ("UNITS DISTANCE MICRONS");
+    if (u != std::string::npos) {
+      std::istringstream us (deftext.substr (u + 22, 64));
+      double n = 0;
+      if (us >> n && n > 0) {
+        def_units = n;
+      }
+    }
+  }
+  double def_scale = (def_units * m_dbu > 0.0 ? 1.0 / (def_units * m_dbu) : 1.0);
+
+  //  COMPONENTS block only. Tokenise and parse each "- <inst> <master> ... +
+  //  (PLACED|FIXED) ( x y ) <orient> ... ;" record (placement is on the record).
+  std::string::size_type cb = deftext.find ("COMPONENTS");
+  std::string::size_type ce = deftext.find ("END COMPONENTS");
+  if (cb != std::string::npos && ce != std::string::npos && ce > cb) {
+    std::istringstream cs (deftext.substr (cb, ce - cb));
+    std::string tok;
+    std::string inst, master, orient;
+    bool in_rec = false, seen_place = false, want_coords = false;
+    long cx = 0, cy = 0;
+    int coord_i = 0;
+    while (cs >> tok) {
+      if (tok == "-") {
+        in_rec = true; seen_place = false; want_coords = false; coord_i = 0;
+        inst.clear (); master.clear (); orient.clear ();
+        if (cs >> inst) { cs >> master; }
+        continue;
+      }
+      if (! in_rec) {
+        continue;
+      }
+      if (tok == "PLACED" || tok == "FIXED") {
+        seen_place = true; want_coords = true; coord_i = 0;
+        continue;
+      }
+      if (want_coords) {
+        if (tok == "(") { continue; }
+        if (tok == ")") { want_coords = false; continue; }
+        //  two integer coords between the parens
+        long v = 0;
+        std::istringstream vs (tok);
+        if (vs >> v) {
+          if (coord_i == 0) { cx = v; coord_i = 1; }
+          else if (coord_i == 1) { cy = v; coord_i = 2; }
+        }
+        continue;
+      }
+      if (seen_place && orient.empty () &&
+          (tok == "N" || tok == "S" || tok == "E" || tok == "W" ||
+           tok == "FN" || tok == "FS" || tok == "FE" || tok == "FW")) {
+        orient = tok;
+        //  emit the placement now that we have master + coords + orient
+        std::map<std::string, db::Region>::iterator mi = m_feol_master.find (master);
+        int rot = 0; bool mirr = false;
+        if (mi != m_feol_master.end () && def_orient (orient, rot, mirr)) {
+          db::Vector disp ((db::Coord) std::llround (cx * def_scale),
+                           (db::Coord) std::llround (cy * def_scale));
+          db::Trans tr (rot, mirr, disp);
+          FeolInst fi;
+          fi.foot = &mi->second;
+          fi.foot_strict = &m_feol_master_strict[master];
+          fi.trans = tr;
+          fi.pbox = tr * mi->second.bbox ();
+          m_feol_insts.push_back (fi);
+          std::map<std::string, db::Region>::iterator ffi = master_feol.find (master);
+          if (ffi != master_feol.end () && ! ffi->second.empty ()) {
+            m_feol_qual_feol += ffi->second.transformed (tr);   // placed RAW FEOL geometry
+          }
+        }
+        continue;
+      }
+      if (tok == ";") {
+        in_rec = false;
+        continue;
+      }
+    }
+  }
+  m_feol_qual_feol.merge ();
+
+  m_feol_enabled = true;                 // built (even if 0 instances -> exempts nothing, still safe)
+}
+
+db::EdgePairs SVRFEngine::feol_exempt_filter (const SVRFRule &r, const db::EdgePairs &ep)
+{
+  //  top-level (non-cell-interior) FEOL for THIS rule's input layer: the flat
+  //  FEOL geometry OUTSIDE every placed qualified footprint. resolve() is a cache
+  //  hit here (the rule already resolved layer1; parallel rules were prewarmed),
+  //  so it never mutates m_regions under worker threads. An edge-typed input
+  //  resolves EMPTY -> we bail out (provable no-op) rather than risk an unsafe
+  //  exemption with no top-level guard.
+  db::Region feol_all = resolve (r.layer1);
+  if (feol_all.empty ()) {
+    return ep;
+  }
+  //  top-level FEOL = this rule's FEOL minus the RAW FEOL geometry of every
+  //  placed qualified master. A top-level / non-qualified shard -- even one
+  //  sitting inside a cell's footprint rectangle -- survives here (it is not any
+  //  master's own geometry), so a violation it forms is never exempted.
+  db::Region top_feol = feol_all - m_feol_qual_feol;
+
+  db::EdgePairs kept;
+  for (db::EdgePairs::const_iterator it = ep.begin (); ! it.at_end (); ++it) {
+    const db::EdgePair &epair = *it;
+    bool exempt = false;
+
+    //  error bridge: two long sides ARE the two violating edges.
+    db::Polygon bridge = epair.to_polygon (0);
+    db::Region P (bridge);                 // explicit Region(const Polygon&) ctor (exported)
+    if (! P.empty ()) {
+      db::Box pbox = bridge.box ();
+      //  (1)+(2) strict single-master containment (cheap: bbox filter + local
+      //  boolean per candidate instance). strict_cover==1 => exactly one cell
+      //  strictly contains the bridge; ==2 => ambiguous / boundary-touch => keep.
+      int strict_cover = 0;
+      for (std::size_t k = 0; k < m_feol_insts.size () && strict_cover < 2; ++k) {
+        const FeolInst &fi = m_feol_insts[k];
+        if (! pbox.inside (fi.pbox)) {
+          continue;                      // cannot fully contain the bridge
+        }
+        db::Region Plocal = P.transformed (fi.trans.inverted ());
+        if (! (Plocal - *fi.foot).empty ()) {
+          continue;                      // bridge not fully inside this cell's exact footprint
+        }
+        if (fi.foot_strict->empty () || ! (Plocal - *fi.foot_strict).empty ()) {
+          strict_cover = 2;              // covered but touches the cell boundary -> never exempt
+        } else {
+          strict_cover += 1;             // strictly interior to exactly this cell
+        }
+      }
+      //  (3) top-level guard -- only for a single strict cover (keeps the
+      //  expensive interaction test off the hot path of non-candidates).
+      if (strict_cover == 1 && top_feol.selected_interacting (P).count () == 0) {
+        exempt = true;
+      }
+    }
+
+    if (! exempt) {
+      kept.insert (epair);               // preserve the pair verbatim (incl. symmetric flag)
+    }
+  }
+  return kept;
 }
 
 // ---------------------------------------------------------------------------
@@ -955,12 +1516,12 @@ bool SVRFEngine::is_edge_rule (const SVRFRule &r) const
 //  edge-typed rule dispatch
 // ---------------------------------------------------------------------------
 
-void SVRFEngine::exec_edge_rule (const SVRFRule &r)
+void SVRFEngine::exec_edge_rule (const SVRFRule &r, std::size_t slot)
 {
   if (r.op != "EXTERNAL" && r.op != "INTERNAL" && r.op != "ENCLOSURE") {
     SVRFResult res; res.verdict = "SKIP"; res.rule = &r;
     res.info = "edge op " + r.op + " has no Edges check";
-    m_results.push_back (res);
+    m_results[slot] = res;
     return;
   }
   db::Coord d = to_dbu (r.value);
@@ -984,10 +1545,17 @@ void SVRFEngine::exec_edge_rule (const SVRFRule &r)
   if (! ok) {
     SVRFResult res; res.verdict = "SKIP"; res.rule = &r;
     res.info = "edge-check unsupported";
-    m_results.push_back (res);
+    m_results[slot] = res;
     return;
   }
   ep = drop_coincident_pairs (ep, r.region_out, r.has_ignore_angle);
+  //  cell-aware FEOL over-fire exemption (fork fix #2): only when opt-in AND this
+  //  rule is a named FEOL space/notch rule. Disabled => this block is skipped ->
+  //  byte-identical. (For an edge-typed layer the filter is a provable no-op --
+  //  its top-level FEOL region resolves empty -- so it stays safe here too.)
+  if (m_feol_enabled && m_feol_rules.count (r.name)) {
+    ep = feol_exempt_filter (r, ep);
+  }
   size_t cnt = ep.count ();
   db::Region errpoly;
   ep.polygons (errpoly);
@@ -1015,14 +1583,14 @@ void SVRFEngine::exec_edge_rule (const SVRFRule &r)
   SVRFResult res; res.rule = &r;
   res.verdict = cnt == 0 ? "PASS" : "FAIL";
   res.info = std::to_string (cnt);
-  m_results.push_back (res);
+  m_results[slot] = res;
 }
 
 // ---------------------------------------------------------------------------
 //  density windowing
 // ---------------------------------------------------------------------------
 
-void SVRFEngine::exec_density (const SVRFRule &r)
+void SVRFEngine::exec_density (const SVRFRule &r, std::size_t slot)
 {
   db::Region reg = resolve (r.layer1);
   if (! r.layer2.empty ()) {
@@ -1043,7 +1611,7 @@ void SVRFEngine::exec_density (const SVRFRule &r)
   db::Box extent = m_layout.cell (m_top).bbox ();
   if (extent.empty ()) {
     SVRFResult res; res.rule = &r; res.verdict = "PASS"; res.info = "0";
-    m_results.push_back (res);
+    m_results[slot] = res;
     return;
   }
   double thr = r.value;
@@ -1091,14 +1659,14 @@ void SVRFEngine::exec_density (const SVRFRule &r)
   SVRFResult res; res.rule = &r;
   res.verdict = cnt == 0 ? "PASS" : "FAIL";
   res.info = std::to_string (cnt);
-  m_results.push_back (res);
+  m_results[slot] = res;
 }
 
 // ---------------------------------------------------------------------------
 //  measurement rule dispatch
 // ---------------------------------------------------------------------------
 
-void SVRFEngine::exec_rule (const SVRFRule &r)
+void SVRFEngine::exec_rule (const SVRFRule &r, std::size_t slot)
 {
   //  COPY: report a previously-computed error layer (foundry rule naming)
   if (r.op == "COPY") {
@@ -1106,7 +1674,7 @@ void SVRFEngine::exec_rule (const SVRFRule &r)
     if (m_unmodeled.count (src)) {           // antenna / net-ratio etc: honest SKIP, never PASS
       SVRFResult res; res.rule = &r; res.verdict = "SKIP";
       res.info = "errlayer '" + src + "' routed to dedicated checker";
-      m_results.push_back (res);
+      m_results[slot] = res;
       return;
     }
     std::map<std::string, db::Region>::iterator it = m_regions.find (src);
@@ -1115,7 +1683,7 @@ void SVRFEngine::exec_rule (const SVRFRule &r)
       if (! drawn (src, reg)) {
         SVRFResult res; res.rule = &r; res.verdict = "SKIP";
         res.info = "errlayer '" + src + "' unresolved";
-        m_results.push_back (res);
+        m_results[slot] = res;
         return;
       }
       m_regions[src] = reg;
@@ -1127,28 +1695,28 @@ void SVRFEngine::exec_rule (const SVRFRule &r)
     SVRFResult res; res.rule = &r;
     res.verdict = c == 0 ? "PASS" : "FAIL";
     res.info = std::to_string (c);
-    m_results.push_back (res);
+    m_results[slot] = res;
     return;
   }
 
   if (! r.supported) {
     SVRFResult res; res.rule = &r; res.verdict = "SKIP";
     res.info = r.reason.empty () ? "unsupported" : r.reason;
-    m_results.push_back (res);
+    m_results[slot] = res;
     return;
   }
   if (inputs_unmodeled (r)) {
     SVRFResult res; res.rule = &r; res.verdict = "SKIP";
     res.info = "input layer is edge-typed/unmodeled";
-    m_results.push_back (res);
+    m_results[slot] = res;
     return;
   }
   if (is_edge_rule (r)) {
-    exec_edge_rule (r);
+    exec_edge_rule (r, slot);
     return;
   }
   if (r.op == "DENSITY") {
-    exec_density (r);
+    exec_density (r, slot);
     return;
   }
 
@@ -1161,20 +1729,20 @@ void SVRFEngine::exec_rule (const SVRFRule &r)
       if (m_deck.connects.empty ()) {
         SVRFResult res; res.rule = &r; res.verdict = "SKIP";
         res.info = "connectivity but no CONNECT stack";
-        m_results.push_back (res);
+        m_results[slot] = res;
         return;
       }
       if (r.op != "EXTERNAL" || r.layer2.empty ()) {
         SVRFResult res; res.rule = &r; res.verdict = "SKIP";
         res.info = "connectivity needs 2-layer EXTERNAL";
-        m_results.push_back (res);
+        m_results[slot] = res;
         return;
       }
       build_l2n ();
       if (! m_l2n_layers.count (r.layer1) || ! m_l2n_layers.count (r.layer2)) {
         SVRFResult res; res.rule = &r; res.verdict = "SKIP";
         res.info = "net layer has no extracted shapes";
-        m_results.push_back (res);
+        m_results[slot] = res;
         return;
       }
       db::RegionCheckOptions o = check_options (r);
@@ -1212,7 +1780,7 @@ void SVRFEngine::exec_rule (const SVRFRule &r)
       } else {
         SVRFResult res; res.rule = &r; res.verdict = "SKIP";
         res.info = "op " + r.op + " not in core";
-        m_results.push_back (res);
+        m_results[slot] = res;
         return;
       }
       if (have_ep) {
@@ -1223,16 +1791,23 @@ void SVRFEngine::exec_rule (const SVRFRule &r)
     SVRFResult res; res.rule = &r; res.verdict = "ERROR";
     std::string m = e.msg (); if (m.size () > 80) m = m.substr (0, 80);
     res.info = m;
-    m_results.push_back (res);
+    m_results[slot] = res;
     return;
   } catch (...) {
     SVRFResult res; res.rule = &r; res.verdict = "ERROR";
     res.info = "check error";
-    m_results.push_back (res);
+    m_results[slot] = res;
     return;
   }
   if (have_ep) {
     ep = drop_coincident_pairs (ep, r.region_out, r.has_ignore_angle);
+    //  cell-aware FEOL over-fire exemption (fork fix #2): only when opt-in AND
+    //  this rule is a named FEOL space/notch rule. Disabled => skipped ->
+    //  byte-identical. r.layer1 was resolved above (cache hit / prewarmed) so the
+    //  filter's resolve() never mutates m_regions under worker threads.
+    if (m_feol_enabled && m_feol_rules.count (r.name)) {
+      ep = feol_exempt_filter (r, ep);
+    }
     viol.clear ();
     ep.polygons (viol);
   }
@@ -1250,7 +1825,7 @@ void SVRFEngine::exec_rule (const SVRFRule &r)
   SVRFResult res; res.rule = &r;
   res.verdict = cnt == 0 ? "PASS" : "FAIL";
   res.info = std::to_string (cnt);
-  m_results.push_back (res);
+  m_results[slot] = res;
 }
 
 // ---------------------------------------------------------------------------

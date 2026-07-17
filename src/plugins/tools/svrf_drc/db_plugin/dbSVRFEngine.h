@@ -47,6 +47,8 @@
 #include <map>
 #include <set>
 #include <memory>
+#include <utility>
+#include <cstddef>
 
 namespace db
 {
@@ -81,6 +83,32 @@ public:
   //  the accumulated results (also available via results()).
   const std::vector<SVRFResult> &execute ();
 
+  //  Number of worker threads for the parallel MEASUREMENT-rule phase. N<=1 (the
+  //  default) reproduces today's EXACT serial behaviour byte-for-byte -- every
+  //  rule runs inline in source order and no thread is spawned. N>1 dispatches the
+  //  independent measurement rules (not DENSITY / not connectivity / not consumed
+  //  by a later derivation) across a worker pool AFTER a single-threaded
+  //  pre-realization pass; the emitted report is order-stable (slot-indexed) and
+  //  byte-identical to the N=1 report regardless of scheduling.
+  void set_threads (int n) { m_threads = n; }
+  int threads () const { return m_threads; }
+
+  //  --- cell-aware FEOL over-fire exemption (OPT-IN; Route B, fork fix #2) ----
+  //  An EMPTY config path (the DEFAULT) => the exemption is DISABLED and NONE of
+  //  the code below runs, so the emitted report is BYTE-IDENTICAL to the
+  //  threading-only (#1) binary. When a config path is set the engine, at the
+  //  head of execute(), builds a per-PLACED-INSTANCE EXACT footprint index (from
+  //  the qualified-master library GDS + the DEF placements named in the config)
+  //  and, for ONLY the FEOL space/notch rules named in the config, DROPS an error
+  //  edge-pair IFF BOTH its edges lie STRICTLY INTERIOR to a SINGLE qualified
+  //  master's exact placed footprint AND no top-level (non-cell-interior) FEOL
+  //  shape forms it. This is a CONSERVATIVE lower bound: on ANY doubt the
+  //  violation is KEPT (the exemption never changes an inter-cell / boundary /
+  //  top-level verdict -> never false-clean). See dbSVRFEngine.cc for the exact
+  //  discriminator and its safety argument.
+  void set_cell_aware_feol (const std::string &cfg_path) { m_feol_cfg_path = cfg_path; }
+  const std::string &cell_aware_feol () const { return m_feol_cfg_path; }
+
   //  Emit the frozen report to `report_path`. `klayout_version` fills the header
   //  "# SVRF-native DRC via KLayout <ver>" line (empty is allowed -> trailing space
   //  is stripped, matching the Python `.rstrip()`).
@@ -102,6 +130,33 @@ private:
   std::set<std::string> m_edge_layers;
   std::set<std::string> m_unmodeled;
   std::vector<SVRFResult> m_results;
+  int m_threads = 1;                 // worker count for the parallel rule phase
+
+  //  -- cell-aware FEOL exemption state (fork fix #2) ----------------------
+  //  Built ONCE by setup_cell_aware_feol() at the head of execute() and only
+  //  READ during the (possibly parallel) rule phase -> safe to share across
+  //  worker threads. m_feol_enabled stays false unless a config path was set.
+  std::string m_feol_cfg_path;                         // "" => disabled (byte-identical)
+  bool m_feol_enabled = false;
+  db::Coord m_feol_strict = 1;                          // strict-interior margin (dbu, >=1)
+  std::set<std::string> m_feol_rules;                  // rule names the exemption applies to
+  std::vector<std::pair<int, int> > m_feol_gds;        // raw FEOL (gds,datatype) layers (for the top-level guard)
+  std::map<std::string, db::Region> m_feol_master;         // master -> local exact footprint (all-layer union)
+  std::map<std::string, db::Region> m_feol_master_strict;  // master -> footprint eroded inward by m_feol_strict
+  struct FeolInst
+  {
+    const db::Region *foot;        // -> m_feol_master[master]        (std::map node ptr: stable)
+    const db::Region *foot_strict; // -> m_feol_master_strict[master]
+    db::Trans trans;               // placement transform (DEF orient + origin), dbu
+    db::Box pbox;                  // placed-footprint bbox (fast reject)
+  };
+  std::vector<FeolInst> m_feol_insts;                  // one per placed qualified instance
+  //  Merged union of every placed qualified master's RAW FEOL geometry (the
+  //  m_feol_gds layers) -- NOT the all-layer footprint. The top-level guard
+  //  subtracts THIS from the rule's FEOL so that a top-level / non-qualified
+  //  FEOL shard sitting INSIDE a cell's footprint rectangle still shows up as
+  //  top-level (a footprint-rectangle subtraction would wrongly erase it).
+  db::Region m_feol_qual_feol;
 
   //  built lazily from the CONNECT stack for connectivity / net-area-ratio rules
   std::unique_ptr<db::LayoutToNetlist> m_l2n;
@@ -126,13 +181,39 @@ private:
   db::Edges  coincident_edges (const db::Edges &ea, const db::Edges &eb, int want); // want: 1 inside, 0 outside, -1 none
 
   //  -- checks (Engine._exec_rule / _exec_edge_rule / _exec_density) -------
-  void exec_rule (const SVRFRule &r);
-  void exec_edge_rule (const SVRFRule &r);
-  void exec_density (const SVRFRule &r);
+  //  Each writes its single report line into m_results[slot] (a pre-assigned,
+  //  source-order slot) rather than push_back, so the report byte-order is
+  //  identical regardless of whether the rule ran inline or on a worker thread.
+  void exec_rule (const SVRFRule &r, std::size_t slot);
+  void exec_edge_rule (const SVRFRule &r, std::size_t slot);
+  void exec_density (const SVRFRule &r, std::size_t slot);
   db::RegionCheckOptions check_options (const SVRFRule &r, bool allow_filters = true) const;
   db::EdgesCheckOptions  edge_check_options (const SVRFRule &r) const;
   bool inputs_unmodeled (const SVRFRule &r) const;
   bool is_edge_rule (const SVRFRule &r) const;
+
+  //  -- parallel measurement-rule phase -----------------------------------
+  //  Single-threaded pre-realization: resolve every parallel-rule input on the
+  //  main thread (so std::map is never structurally mutated under threads) and
+  //  force each input region's lazy merged/bbox caches valid (so worker copies
+  //  only READ shared state). Pre-create each rule's error-layer slot too.
+  void prewarm_for_parallel (const std::vector<std::pair<const SVRFRule *, std::size_t> > &par);
+  //  Dispatch the pre-realized rules across m_threads workers (dynamic grab via
+  //  an atomic index). Each worker calls exec_rule(r, slot) into its own slot.
+  void run_parallel (const std::vector<std::pair<const SVRFRule *, std::size_t> > &par);
+
+  //  -- cell-aware FEOL exemption (fork fix #2) ----------------------------
+  //  Parse the config, read the master library GDS + DEF, and build the exact
+  //  per-placed-instance footprint index. A no-op (leaves m_feol_enabled false)
+  //  when no config path was set -> byte-identical default. Runs single-threaded
+  //  at the head of execute(), before any rule.
+  void setup_cell_aware_feol ();
+  //  Return a copy of `ep` with the qualified-cell-interior over-fire edge-pairs
+  //  removed. CONSERVATIVE: an edge-pair is dropped ONLY when its error bridge is
+  //  strictly interior to a SINGLE placed qualified footprint and no top-level
+  //  FEOL shape forms it; anything ambiguous is kept. Called ONLY for rules whose
+  //  name is in m_feol_rules, after drop_coincident_pairs.
+  db::EdgePairs feol_exempt_filter (const SVRFRule &r, const db::EdgePairs &ep);
 
   //  -- connectivity (Engine._build_l2n / _l2n_nets / _net_area_ratio) -----
   void build_l2n ();
