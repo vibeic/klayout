@@ -32,6 +32,7 @@
 #include "tlThreads.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -2004,6 +2005,225 @@ void SVRFEngine::exec_density (const SVRFRule &r, std::size_t slot)
 }
 
 // ---------------------------------------------------------------------------
+//  Route B, Phase 1: spatial tiling of finite-reach EXTERNAL (space/separation)
+//
+//  Studied from KLayout's OWN tiled DRC (src/drc/.../_drc_engine.rb::_tcmd +
+//  db::TilingProcessor): a tile collects every WHOLE shape within `border` of its
+//  core (dbTilingProcessor.cc:597-606 confine_region keeps shapes uncut) and runs
+//  the check per tile. KLayout's generic edge-pair output receiver then keeps a
+//  pair by TOUCH (`first.clipped(core) || second.clipped(core)`,
+//  dbTilingProcessor.h:240) -- correct for stitching a Region geometry, but it
+//  DOUBLE-COUNTS an edge-pair whose two edges (or one long facing run) straddle
+//  more than one core, so it is NOT byte-identical for an edge-pair *count*
+//  report. We keep KLayout's whole-shape halo collection and replace the touch
+//  receiver with an EXACT-geometric dedup, which IS byte-identical: because each
+//  tile sees the WHOLE merged polygons, every tile that computes a given violation
+//  computes the byte-identical edge pair, so a set keyed on the endpoint coords
+//  collapses the duplicates to precisely the flat set.
+// ---------------------------------------------------------------------------
+
+bool SVRFEngine::tiled_space_enabled (const SVRFRule &r) const
+{
+  if (r.op != "EXTERNAL") {
+    return false;                                   // Phase 1: space / separation only
+  }
+  if (r.connectivity != SVRFConnectivity::none) {
+    return false;                                   // net-aware checks stay on the serial path
+  }
+  if (const char *env = getenv ("SVRFDRC_TILE_SPACE")) {
+    return atoi (env) > 0;                           // explicit N>0 enables, 0 disables
+  }
+  return m_threads > 1;                              // default: follow --threads
+}
+
+db::EdgePairs
+SVRFEngine::tiled_external_check (db::Region &l1, const db::Region *l2,
+                                  db::Coord d, const db::RegionCheckOptions &o) const
+{
+  const bool two_layer = (l2 != 0);
+
+  //  (1) merge the operands ONCE (single-threaded). The flat check merges its
+  //  inputs internally, so this changes nothing about the RESULT -- but it makes
+  //  the tiling unit the WHOLE flat polygon, so selected_interacting hands each
+  //  tile a complete polygon (never a halo-cut fragment). merged() materializes a
+  //  flat region; prewarming bbox/merged caches lets the tile workers only READ.
+  db::Region l1m = l1.merged ();
+  db::Region l2m;
+  l1m.bbox (); { db::RegionIterator wi = l1m.begin_merged (); (void) wi; }
+  db::Box bb = l1m.bbox ();
+  if (two_layer) {
+    l2m = l2->merged ();
+    l2m.bbox (); { db::RegionIterator wi = l2m.begin_merged (); (void) wi; }
+    bb += l2m.bbox ();
+  }
+  if (bb.empty ()) {
+    return db::EdgePairs ();
+  }
+
+  //  (2) halo = the rule's finite reach (+1 dbu touch-safety). A neighbour polygon
+  //  farther than this can never form a violation with a polygon in the core.
+  //  Matches KLayout's own DRC tile border: value for Euclidian/Projection,
+  //  1.5*value for Square (_drc_layer.rb ~4409).
+  db::Coord reach = d;
+  if (o.metrics == db::Square) {
+    reach = (db::Coord) std::llround (std::ceil (1.5 * (double) d));
+  }
+  db::Coord border = reach + 1;
+  if (border < 1) {
+    border = 1;
+  }
+
+  //  (3) tile grid. Cores tile-COVER the bbox; halos = cores grown by border. With
+  //  the exact dedup the grid NEVER changes the result (only the work split), so
+  //  any covering grid is byte-identical -- we only need every violation's location
+  //  to land in some core. per-axis: SVRFDRC_TILE_SPACE=N forces N (stress test),
+  //  else auto ~ sqrt(threads).
+  bool forced = false;
+  int per = 0;
+  if (const char *env = getenv ("SVRFDRC_TILE_SPACE")) {
+    per = atoi (env);
+    forced = (per > 0);
+  }
+  if (per <= 0) {
+    per = (int) std::ceil (std::sqrt ((double) std::max (1, m_threads)));
+  }
+  if (per < 1) {
+    per = 1;
+  }
+  int nx = per, ny = per;
+  if (! forced) {
+    //  auto: don't cut tiles below ~4*border (halo overhead would dominate and it
+    //  buys no parallelism). Forced grids are honoured verbatim (boundary stress).
+    long long minspan = (long long) border * 4 + 1;
+    while (nx > 1 && ((long long) bb.width () / nx) < minspan) {
+      nx -= 1;
+    }
+    while (ny > 1 && ((long long) bb.height () / ny) < minspan) {
+      ny -= 1;
+    }
+  }
+
+  std::vector<db::Box> cores;
+  cores.reserve ((std::size_t) nx * (std::size_t) ny);
+  const db::Coord x0 = bb.left (), y0 = bb.bottom ();
+  const long long W = bb.width (), H = bb.height ();
+  for (int iy = 0; iy < ny; ++iy) {
+    db::Coord cy0 = (db::Coord) (y0 + (H * iy) / ny);
+    db::Coord cy1 = (iy + 1 == ny) ? bb.top () : (db::Coord) (y0 + (H * (iy + 1)) / ny);
+    for (int ix = 0; ix < nx; ++ix) {
+      db::Coord cx0 = (db::Coord) (x0 + (W * ix) / nx);
+      db::Coord cx1 = (ix + 1 == nx) ? bb.right () : (db::Coord) (x0 + (W * (ix + 1)) / nx);
+      cores.push_back (db::Box (cx0, cy0, cx1, cy1));
+    }
+  }
+  const std::size_t ntiles = cores.size ();
+
+  //  (4) per-tile check into a per-tile slot (no shared mutable merge structure ->
+  //  deterministic result for any thread count and across re-runs). Each tile
+  //  collects the WHOLE polygons interacting with its halo and runs the IDENTICAL
+  //  flat check on that sub-region.
+  std::vector<db::EdgePairs> per_tile (ntiles);
+  const db::Vector bvec (border, border);
+  auto do_tile = [&] (std::size_t i) {
+    db::Region hb;
+    hb.insert (cores[i].enlarged (bvec));
+    db::Region a = l1m.selected_interacting (hb);
+    if (a.empty ()) {
+      return;                                        // nothing of l1 near this core
+    }
+    if (two_layer) {
+      db::Region b = l2m.selected_interacting (hb);
+      per_tile[i] = a.separation_check (b, d, o);
+    } else {
+      per_tile[i] = a.space_check (d, o);
+    }
+  };
+
+  int nw = m_threads;
+  if (nw < 1) {
+    nw = 1;
+  }
+  if ((std::size_t) nw > ntiles) {
+    nw = (int) ntiles;
+  }
+  if (nw <= 1 || ntiles <= 1) {
+    for (std::size_t i = 0; i < ntiles; ++i) {
+      do_tile (i);
+    }
+  } else {
+    std::atomic<std::size_t> next (0);
+    std::vector<std::unique_ptr<SVRFFnThread> > workers;
+    workers.reserve ((std::size_t) nw);
+    for (int t = 0; t < nw; ++t) {
+      SVRFFnThread *w = new SVRFFnThread ();
+      w->fn = [&do_tile, &next, ntiles] () {
+        for (;;) {
+          std::size_t i = next.fetch_add (1, std::memory_order_relaxed);
+          if (i >= ntiles) {
+            break;
+          }
+          do_tile (i);
+        }
+      };
+      workers.push_back (std::unique_ptr<SVRFFnThread> (w));
+    }
+    for (int t = 0; t < nw; ++t) {
+      workers[t]->start ();
+    }
+    for (int t = 0; t < nw; ++t) {
+      workers[t]->wait ();
+    }
+  }
+
+  //  (5) merge with EXACT geometric dedup. Every tile that sees both whole operand
+  //  polygons of a given violation computes the SAME violation, so a per-violation
+  //  key collapses the duplicates to exactly the flat set.
+  //
+  //  CRITICAL (verified against KLayout's own space_check): the (first,second)
+  //  assignment and each edge's p1->p2 DIRECTION are NOT canonical -- they depend
+  //  on the input polygon processing order, which differs between tiles (and vs
+  //  the flat run). So the naive 8-coord "as-reported" key sees the SAME violation
+  //  under two different orderings and fails to collapse it -> a boundary-straddling
+  //  pair double-counts (measured: single-layer space 33->35/37, M1 space 35->38 at
+  //  fine grids). The key must therefore be ORDER-INDEPENDENT: normalize each edge
+  //  to sorted endpoints (kills p1<->p2 direction) and sort the two edges (kills
+  //  first<->second swap). Two DISTINCT violations always have a distinct unordered
+  //  {undirected-edge, undirected-edge} set, so this never over-collapses. Result
+  //  is byte-identical to flat for ANY grid / thread count (proven: canon-dedup ==
+  //  flat count at every grid 1..64).
+  db::EdgePairs out;
+  std::set<std::array<db::Coord, 8> > seen;
+  for (std::size_t i = 0; i < ntiles; ++i) {
+    for (db::EdgePairs::const_iterator p = per_tile[i].begin (); ! p.at_end (); ++p) {
+      const db::Edge &e1 = (*p).first ();
+      const db::Edge &e2 = (*p).second ();
+      db::Coord a[4] = { e1.p1 ().x (), e1.p1 ().y (), e1.p2 ().x (), e1.p2 ().y () };
+      db::Coord b[4] = { e2.p1 ().x (), e2.p1 ().y (), e2.p2 ().x (), e2.p2 ().y () };
+      //  undirected each edge: order its two endpoints (x, then y)
+      if (a[0] > a[2] || (a[0] == a[2] && a[1] > a[3])) {
+        std::swap (a[0], a[2]); std::swap (a[1], a[3]);
+      }
+      if (b[0] > b[2] || (b[0] == b[2] && b[1] > b[3])) {
+        std::swap (b[0], b[2]); std::swap (b[1], b[3]);
+      }
+      //  unordered pair: order the two (now-undirected) edges lexicographically
+      bool a_first = std::lexicographical_compare (a, a + 4, b, b + 4)
+                     || std::equal (a, a + 4, b);
+      std::array<db::Coord, 8> k;
+      if (a_first) {
+        k = {{ a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3] }};
+      } else {
+        k = {{ b[0], b[1], b[2], b[3], a[0], a[1], a[2], a[3] }};
+      }
+      if (seen.insert (k).second) {
+        out.insert (*p);
+      }
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 //  measurement rule dispatch
 // ---------------------------------------------------------------------------
 
@@ -2102,7 +2322,17 @@ void SVRFEngine::exec_rule (const SVRFRule &r, std::size_t slot)
       db::Region l1 = resolve (r.layer1);
       if (r.op == "EXTERNAL") {
         db::RegionCheckOptions o = check_options (r);
-        ep = r.layer2.empty () ? l1.space_check (d, o) : l1.separation_check (resolve (r.layer2), d, o);
+        if (tiled_space_enabled (r)) {
+          //  Route B, Phase 1: byte-identical spatial-tiling parallel path.
+          if (r.layer2.empty ()) {
+            ep = tiled_external_check (l1, 0, d, o);
+          } else {
+            db::Region l2 = resolve (r.layer2);
+            ep = tiled_external_check (l1, &l2, d, o);
+          }
+        } else {
+          ep = r.layer2.empty () ? l1.space_check (d, o) : l1.separation_check (resolve (r.layer2), d, o);
+        }
         have_ep = true;
       } else if (r.op == "INTERNAL") {
         if (r.layer2.empty ()) {

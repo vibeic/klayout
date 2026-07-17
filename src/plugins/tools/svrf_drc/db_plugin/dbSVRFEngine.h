@@ -200,6 +200,22 @@ private:
   bool inputs_unmodeled (const SVRFRule &r) const;
   bool is_edge_rule (const SVRFRule &r) const;
 
+  //  -- Route B, Phase 1: spatial tiling of finite-reach EXTERNAL checks ----
+  //  gate: engage the tiled space/separation path (op EXTERNAL, non-connectivity)
+  //  when --threads>1 (or SVRFDRC_TILE_SPACE=N>0 forces N tiles/axis; =0 disables).
+  bool tiled_space_enabled (const SVRFRule &r) const;
+  //  Byte-identical parallel space_check/separation_check by spatial tiles. The
+  //  operands are merged ONCE (single-threaded) so the tiling unit is the WHOLE
+  //  flat polygon; each tile collects the whole polygons within `border` (the
+  //  rule's finite reach) of its core via selected_interacting -- never a cut
+  //  fragment -- and runs the IDENTICAL flat check on that sub-region. Every tile
+  //  that sees both operands of a violation therefore computes the byte-identical
+  //  edge pair, and an EXACT-geometric dedup at merge collapses those duplicates
+  //  to exactly the flat edge-pair set. Result (and hence the report COUNT) is
+  //  independent of grid and thread count -> byte-identical to the flat path.
+  db::EdgePairs tiled_external_check (db::Region &l1, const db::Region *l2,
+                                      db::Coord d, const db::RegionCheckOptions &o) const;
+
   //  -- parallel measurement-rule phase -----------------------------------
   //  Single-threaded pre-realization: resolve every parallel-rule input on the
   //  main thread (so std::map is never structurally mutated under threads) and
