@@ -291,7 +291,7 @@ const std::vector<SVRFResult> &SVRFEngine::execute ()
   //  Also count how many rules share each output name: a non-unique name would
   //  make two rules write the SAME m_regions[name] error layer, so such rules stay
   //  serial (preserving the source-order last-writer-wins) rather than racing.
-  //  (Rule names are unique in the commercial-PDK deck, so this excludes nothing there --
+  //  (Rule names are unique in the commercial deck, so this excludes nothing there --
   //  it is a correctness guard for arbitrary decks.)
   std::map<std::string, int> name_count;
   for (std::vector<SVRFRule>::const_iterator rr = m_deck.rules.begin (); rr != m_deck.rules.end (); ++rr) {
@@ -668,15 +668,67 @@ void SVRFEngine::run_parallel_derivations (const std::vector<const SVRFDerivatio
   if (batch.empty ()) {
     return;
   }
+
+  //  --- Phase 3: pull the GIANT tileable derivations OUT of the op-level pool ---
+  //  The op-level pool parallelizes ACROSS derivations, but a level dominated by a
+  //  FEW enormous full-chip booleans/sizes/selects leaves most cores idle while one
+  //  worker grinds the giant op single-threaded -- that is the real wall. Run each
+  //  such op ALONE on the main thread with m_deriv_pool_width==1, so its internal
+  //  tiled build (exec_derivation -> tiled_region_build) claims every core. Big and
+  //  small ops in one level are mutually independent (same topological level), so
+  //  processing the big ones first, then the small pool, is order-safe. Big ops run
+  //  with nullptr sinks (direct m_unmodeled/m_edge_layers inserts) -- safe because
+  //  they run single-threaded before the pool spawns.
+  std::vector<const SVRFDerivation *> big, small;
+  big.reserve (batch.size ());
+  small.reserve (batch.size ());
+  for (std::vector<const SVRFDerivation *>::const_iterator it = batch.begin (); it != batch.end (); ++it) {
+    if (is_big_tileable_deriv (**it)) { big.push_back (*it); } else { small.push_back (*it); }
+  }
+
+  if (! big.empty ()) {
+    int saved = m_deriv_pool_width;
+    m_deriv_pool_width = 1;                          // "alone" -> full tile budget
+    for (std::vector<const SVRFDerivation *>::const_iterator it = big.begin (); it != big.end (); ++it) {
+      const SVRFDerivation &d = **it;
+      exec_derivation (d, 0, 0);                     // main thread; internally tiled
+      //  warm its own output for the next level's prewarm (mirrors the pool path)
+      std::map<std::string, db::Region>::iterator ri = m_regions.find (d.name);
+      if (ri != m_regions.end ()) {
+        { db::RegionIterator mi = ri->second.begin_merged (); (void) mi; }
+        ri->second.bbox ();
+      }
+      if (d.edge_typed) {
+        std::map<std::string, db::Edges>::iterator ei = m_edges_ns.find (d.name);
+        if (ei != m_edges_ns.end ()) {
+          { db::EdgesIterator me = ei->second.begin_merged (); (void) me; }
+          ei->second.bbox ();
+        }
+      }
+    }
+    m_deriv_pool_width = saved;
+  }
+
+  if (small.empty ()) {
+    return;
+  }
+
   int nw = m_threads;
   if (nw < 1) {
     nw = 1;
   }
-  if ((std::size_t) nw > batch.size ()) {
-    nw = (int) batch.size ();
+  if ((std::size_t) nw > small.size ()) {
+    nw = (int) small.size ();
   }
-  const std::size_t n = batch.size ();
+  const std::size_t n = small.size ();
   std::atomic<std::size_t> next (0);
+
+  //  Publish the op-level pool WIDTH so a small op that still tiles internally sizes
+  //  its tile pool to m_threads/nw and never oversubscribes past m_threads. When the
+  //  pool saturates the cores (nw==m_threads) that budget is 1 -> the small op runs
+  //  its plain flat build (no nested threads). Written before the workers start.
+  int saved_width = m_deriv_pool_width;
+  m_deriv_pool_width = nw;
 
   //  Per-worker sinks for the two set-typed side effects, merged single-threaded
   //  after the join (the level barrier). No worker touches m_unmodeled /
@@ -694,13 +746,13 @@ void SVRFEngine::run_parallel_derivations (const std::vector<const SVRFDerivatio
     SVRFFnThread *w = new SVRFFnThread ();
     std::vector<std::string> *usink = &unmodeled_sinks[(std::size_t) t];
     std::vector<std::string> *esink = &edge_sinks[(std::size_t) t];
-    w->fn = [this, &batch, &next, n, usink, esink] () {
+    w->fn = [this, &small, &next, n, usink, esink] () {
       for (;;) {
         std::size_t i = next.fetch_add (1, std::memory_order_relaxed);
         if (i >= n) {
           break;
         }
-        const SVRFDerivation &d = *batch[i];
+        const SVRFDerivation &d = *small[i];
         this->exec_derivation (d, usink, esink);
         //  Warm THIS derivation's own output caches. The slot is single-writer this
         //  level (no other worker reads or writes d.name), so filling its mutable
@@ -738,6 +790,7 @@ void SVRFEngine::run_parallel_derivations (const std::vector<const SVRFDerivatio
       m_edge_layers.insert (*s);
     }
   }
+  m_deriv_pool_width = saved_width;                 // restore (main-thread context)
 }
 
 void SVRFEngine::execute_leveled (std::size_t n_noncopy,
@@ -1457,7 +1510,7 @@ db::Edges SVRFEngine::build_edges (const SVRFDerivation &d)
     //  SVRF metric negation + bound strictness (compiler folds `NOT ANGLE
     //  X >0 <90` into negate=1 + strict bounds). Ignoring either turned
     //  that construct into the strictly-inside-(0,90) selection — the EMPTY
-    //  set on a rectilinear layout (commercial-PDK a contact-orientation rule collapse).
+    //  set on a rectilinear layout (a commercial contact-orientation rule collapse).
     bool negate = pflag (d.params, "negate");
     bool lo_strict = pflag (d.params, "lo_strict");
     bool hi_strict = pflag (d.params, "hi_strict");
@@ -1507,7 +1560,7 @@ db::Edges SVRFEngine::build_edges (const SVRFDerivation &d)
     //  an edge lying on b's border is neither inside nor outside. KLayout's
     //  outside_part keeps a boundary edge when its material faces away from
     //  b (e.g. an abutting NACT/PACT interface at the shared boundary),
-    //  which flooded opposite-active spacing checks (commercial-PDK an active-spacing rule.*).
+    //  which flooded opposite-active spacing checks (a commercial spacing-rule family).
     //  Subtract the boundary-coincident parts explicitly.
     db::Region rb = resolve (d.operands[1]);
     return a.outside_part (rb) - rb.edges ();
@@ -1574,27 +1627,95 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d,
   try {
     const std::string &k = d.kind;
     if (k == "bool_expr") {
-      std::vector<std::string> used;
-      db::Region reg = eval_bool_expr (d.expr, used);
-      m_regions[d.name] = reg;
-      for (std::vector<std::string>::iterator u = used.begin (); u != used.end (); ++u) {
-        //  READ of m_unmodeled is safe under the pool: `used` operands are lower-
-        //  level layers whose unmodeled status was committed at a prior barrier;
-        //  the shared set is never structurally mutated during a level (writes go
-        //  to the thread-local sink), so no reader races a writer.
-        if (m_unmodeled.count (*u)) { mark_unmodeled (d.name); break; }
+      //  operand-name set (excludes the AND/OR/NOT/XOR operators + parens), for
+      //  both the tile bbox and the unmodeled propagation.
+      std::set<std::string> op_names;
+      {
+        std::string cur;
+        auto flush = [&] () {
+          if (! cur.empty ()) {
+            std::string u = cur; for (char &c : u) c = (char) std::toupper ((unsigned char) c);
+            if (u != "AND" && u != "OR" && u != "NOT" && u != "XOR") { op_names.insert (cur); }
+            cur.clear ();
+          }
+        };
+        for (std::size_t i = 0; i < d.expr.size (); ++i) {
+          char ch = d.expr[i];
+          if (ch == '(' || ch == ')' || std::isspace ((unsigned char) ch)) { flush (); }
+          else { cur += ch; }
+        }
+        flush ();
+      }
+      //  --threads>1 & alone on the main thread & BOOL tiling enabled -> tile
+      //  (0-halo, clip inputs to disjoint core, union). Else the exact flat eval.
+      if (deriv_tile_enabled (DTC_BOOL) && m_threads > 1 && m_deriv_pool_width <= 1) {
+        db::Box bb;
+        for (std::set<std::string>::const_iterator n = op_names.begin (); n != op_names.end (); ++n) {
+          bb += resolve (*n).bbox ();
+        }
+        std::string expr = d.expr;
+        m_regions[d.name] = tiled_region_build (bb, 0, false,
+          [this, expr] (const db::Box &core, const db::Box &) -> db::Region {
+            db::Region cbox (core);
+            return this->eval_bool_expr_r (expr, [this, &cbox] (const std::string &nm) -> db::Region {
+              db::Region loc = this->resolve (nm).selected_interacting (cbox);
+              loc &= cbox;                 // clip whole shapes to the disjoint core
+              return loc;
+            });
+          });
+      } else {
+        std::vector<std::string> used;
+        db::Region reg = eval_bool_expr (d.expr, used);
+        m_regions[d.name] = reg;
+      }
+      //  unmodeled propagation (identical to the flat path: any operand unmodeled
+      //  taints d). READ of m_unmodeled is safe under the pool -- operands are
+      //  lower-level layers committed at a prior barrier.
+      for (std::set<std::string>::const_iterator n = op_names.begin (); n != op_names.end (); ++n) {
+        if (m_unmodeled.count (*n)) { mark_unmodeled (d.name); break; }
       }
     } else if (k == "bool") {
-      db::Region acc = resolve (d.operands[0]);
-      for (size_t i = 1; i < d.operands.size (); ++i) {
-        db::Region &r = resolve (d.operands[i]);
-        if (d.bool_sym == "&") acc &= r;
-        else if (d.bool_sym == "|") acc |= r;
-        else if (d.bool_sym == "-") acc -= r;
-        else if (d.bool_sym == "^") acc ^= r;
+      if (deriv_tile_enabled (DTC_BOOL) && m_threads > 1 && m_deriv_pool_width <= 1 && ! d.operands.empty ()) {
+        db::Box bb;
+        for (std::vector<std::string>::const_iterator op = d.operands.begin (); op != d.operands.end (); ++op) {
+          bb += resolve (*op).bbox ();
+        }
+        std::vector<std::string> ops = d.operands;
+        std::string sym = d.bool_sym;
+        m_regions[d.name] = tiled_region_build (bb, 0, false,
+          [this, ops, sym] (const db::Box &core, const db::Box &) -> db::Region {
+            db::Region cbox (core);
+            db::Region acc = this->resolve (ops[0]).selected_interacting (cbox);
+            acc &= cbox;                   // clip whole shapes to the disjoint core
+            for (std::size_t i = 1; i < ops.size (); ++i) {
+              db::Region r = this->resolve (ops[i]).selected_interacting (cbox);
+              r &= cbox;
+              if (sym == "&") { acc &= r; }
+              else if (sym == "|") { acc |= r; }
+              else if (sym == "-") { acc -= r; }
+              else if (sym == "^") { acc ^= r; }
+            }
+            return acc;                    // point-local => already within the core
+          });
+      } else {
+        db::Region acc = resolve (d.operands[0]);
+        for (size_t i = 1; i < d.operands.size (); ++i) {
+          db::Region &r = resolve (d.operands[i]);
+          if (d.bool_sym == "&") acc &= r;
+          else if (d.bool_sym == "|") acc |= r;
+          else if (d.bool_sym == "-") acc -= r;
+          else if (d.bool_sym == "^") acc ^= r;
+        }
+        m_regions[d.name] = acc;
       }
-      m_regions[d.name] = acc;
     } else if (k == "size") {
+      //  Build the sizing as a pure function apply_size(in)->out plus a finite
+      //  `reach` (the maximum distance a source point can move the result). Both
+      //  the flat path and the halo-tiled path apply the IDENTICAL apply_size, so
+      //  the tiled result (whole shapes within `reach` of a disjoint core, sized,
+      //  then clipped to the core, unioned) is byte-identical.
+      std::function<db::Region (const db::Region &)> apply_size;
+      db::Coord reach = 0;
       auto it_dir = d.params.find ("dir");
       if (it_dir != d.params.end ()) {
         //  One-sided size (SHRINK/GROW <layer> RIGHT|LEFT|TOP|BOTTOM BY w):
@@ -1608,7 +1729,7 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d,
         //  Sequential R,L,T,B one-sided shrinks compose to the isotropic
         //  size — Calibre's wide-metal derivation idiom relies on this;
         //  treating the qualifier as isotropic corrupted every
-        //  wide-metal chains chain (commercial-PDK a metal1-spacing rule/a wide-metal spacing rule phantoms).
+        //  wide-metal chain (commercial wide-metal spacing-rule phantoms).
         //  possibly a NESTED one-line chain (SHRINK(SHRINK(...R 5) L 5)...):
         //  apply every (dir, value) pair in token order (innermost-out).
         std::vector<std::string> dirs;
@@ -1623,72 +1744,80 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d,
             while (std::getline (vs, tok, ',')) { vals.push_back (std::atof (tok.c_str ())); }
           }
         }
-        db::Region r = resolve (d.operands[0]);
-        for (size_t i = 0; i < dirs.size (); ++i) {
-          double vv = (i < vals.size ()) ? vals[i] : (d.has_value ? d.value : 0.0);
-          db::Coord v = to_dbu (vv);                           // signed
-          db::Coord h = v / 2;
-          db::Coord t = v - h;                                 // dbu-exact split
-          const std::string &dir = dirs[i];
-          if (dir == "RIGHT") {
-            r = r.sized (h, 0); r.transform (db::Disp (db::Vector (t, 0)));
-          } else if (dir == "LEFT") {
-            r = r.sized (h, 0); r.transform (db::Disp (db::Vector (-t, 0)));
-          } else if (dir == "TOP") {
-            r = r.sized (0, h); r.transform (db::Disp (db::Vector (0, t)));
-          } else {  // BOTTOM
-            r = r.sized (0, h); r.transform (db::Disp (db::Vector (0, -t)));
-          }
+        //  reach = sum of the per-step absolute displacements (|sized| + |move| =
+        //  |v| each step); a safe upper bound on how far a point can travel.
+        bool has_value = d.has_value; double dval = d.value;
+        for (std::size_t i = 0; i < dirs.size (); ++i) {
+          double vv = (i < vals.size ()) ? vals[i] : (has_value ? dval : 0.0);
+          reach += std::abs (to_dbu (vv));
         }
-        m_regions[d.name] = r;
+        apply_size = [dirs, vals, has_value, dval, this] (const db::Region &in) -> db::Region {
+          db::Region r = in;
+          for (std::size_t i = 0; i < dirs.size (); ++i) {
+            double vv = (i < vals.size ()) ? vals[i] : (has_value ? dval : 0.0);
+            db::Coord v = to_dbu (vv);                         // signed
+            db::Coord h = v / 2;
+            db::Coord t = v - h;                               // dbu-exact split
+            const std::string &dir = dirs[i];
+            if (dir == "RIGHT") {
+              r = r.sized (h, 0); r.transform (db::Disp (db::Vector (t, 0)));
+            } else if (dir == "LEFT") {
+              r = r.sized (h, 0); r.transform (db::Disp (db::Vector (-t, 0)));
+            } else if (dir == "TOP") {
+              r = r.sized (0, h); r.transform (db::Disp (db::Vector (0, t)));
+            } else {  // BOTTOM
+              r = r.sized (0, h); r.transform (db::Disp (db::Vector (0, -t)));
+            }
+          }
+          return r;
+        };
       } else {
         auto it_morph = d.params.find ("morph");
         if (it_morph != d.params.end () && d.has_value) {
           //  OVERUNDER = close (grow then shrink); UNDEROVER = open
           //  (shrink then grow). d.value is +ve for SIZE ... BY d; the
-          //  two-step derives dense-array cores / removes thin necks.
+          //  two-step derives dense-array cores / removes thin necks. A point can
+          //  reach 2d away (grow d then the opposite size probes another d).
           db::Coord dd = to_dbu (std::abs (d.value));
-          db::Region r = resolve (d.operands[0]);
-          if (it_morph->second == "OVERUNDER") {
-            r = r.sized (dd); r = r.sized (-dd);
-          } else {  // UNDEROVER
-            r = r.sized (-dd); r = r.sized (dd);
-          }
-          m_regions[d.name] = r;
+          bool overunder = (it_morph->second == "OVERUNDER");
+          reach = 2 * dd;
+          apply_size = [dd, overunder] (const db::Region &in) -> db::Region {
+            db::Region r = in;
+            if (overunder) { r = r.sized (dd); r = r.sized (-dd); }
+            else           { r = r.sized (-dd); r = r.sized (dd); }
+            return r;
+          };
         } else {
-          m_regions[d.name] = resolve (d.operands[0]).sized (to_dbu (d.has_value ? d.value : 0.0));
+          db::Coord dd = to_dbu (d.has_value ? d.value : 0.0);
+          reach = std::abs (dd);
+          apply_size = [dd] (const db::Region &in) -> db::Region { return in.sized (dd); };
         }
       }
+      if (deriv_tile_enabled (DTC_SIZE) && m_threads > 1 && m_deriv_pool_width <= 1 && ! d.operands.empty ()) {
+        const db::Region &base = resolve (d.operands[0]);
+        db::Box bb = base.bbox ();
+        bb = bb.enlarged (db::Vector (reach, reach));          // cover grown geometry
+        db::Coord border = reach + 1;
+        if (border < 1) { border = 1; }
+        m_regions[d.name] = tiled_region_build (bb, border, true,
+          [this, &base, &apply_size] (const db::Box &, const db::Box &halo) -> db::Region {
+            db::Region loc = base.selected_interacting (db::Region (halo));  // whole shapes in reach
+            if (loc.empty ()) { return db::Region (); }
+            return apply_size (loc);
+          });
+      } else {
+        m_regions[d.name] = apply_size (resolve (d.operands[0]));
+      }
     } else if (k == "select") {
-      db::Region a = resolve (d.operands[0]);
-      db::Region b = d.operands.size () > 1 ? resolve (d.operands[1]) : db::Region ();
       std::string op = d.select_op;
       for (char &c : op) c = (char) std::toupper ((unsigned char) c);
       bool negate = pflag (d.params, "negate");
-      db::Region res;
-      if (op == "INSIDE") {
-        res = negate ? a.selected_not_inside (b) : a.selected_inside (b);
-      } else if (op == "OUTSIDE") {
-        res = negate ? a.selected_not_outside (b) : a.selected_outside (b);
-      } else if (op == "CUT") {
-        //  Calibre CUT A B: polygons of A that STRADDLE B's boundary — they
-        //  share 2D area with B (part INSIDE B) yet are NOT wholly inside B
-        //  (part OUTSIDE B). This is NOT "every A that interacts B": a pact
-        //  wholly inside its (merged, full-die-width) nwell rail — i.e. every
-        //  PMOS p+ active — interacts nw but does NOT cut it. Mapping CUT onto
-        //  selected_interacting flagged every such pact as a false straddle
-        //  (commercial-PDK a poly-active spacing rule x309 / a poly-active spacing rule x11). Overlapping (area,
-        //  not mere edge-touch) minus wholly-inside == the true straddle set,
-        //  which is EMPTY for a foundry-clean cell.
-        db::Region cut = a.selected_overlapping (b).selected_not_inside (b);
-        res = negate ? (a - cut) : cut;
-      } else {
-        //  INTERACT / TOUCH / ENCLOSE all map to interacting in the reference.
-        //  SVRF interaction-count qualifier (INTERACT A B ==N / >N / <N): fold
-        //  the compiler's count params into KLayout's counted overload; strict
-        //  integral bounds shift by one (>N -> min N+1, <N -> max N-1).
-        size_t cmin = 1;
-        size_t cmax = std::numeric_limits<size_t>::max ();
+      //  parse the INTERACT count qualifier once (needed both to run the op and to
+      //  decide tileability -- the counted path uses RAW-polygon semantics that a
+      //  halo b-gather cannot reproduce, so counted selects stay flat).
+      size_t cmin = 1;
+      size_t cmax = std::numeric_limits<size_t>::max ();
+      {
         auto it_lo = d.params.find ("count_lo");
         auto it_hi = d.params.find ("count_hi");
         if (it_lo != d.params.end ()) {
@@ -1699,21 +1828,63 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d,
           cmax = (size_t) std::strtoull (it_hi->second.c_str (), 0, 10);
           if (pflag (d.params, "count_hi_strict") && cmax > 0) { cmax -= 1; }
         }
-        if (cmin != 1 || cmax != std::numeric_limits<size_t>::max ()) {
-          //  Calibre counts the OTHER layer's ORIGINAL polygons; KLayout's
-          //  merged semantics unions corner-touching polygons first (the 4
-          //  EXPAND-EDGE strips of a square become ONE ring -> count 1 and
-          //  ==4 never matches). Count against the raw polygons.
-          db::Region braw (b);
-          braw.set_merged_semantics (false);
-          res = negate ? a.selected_not_interacting (braw, cmin, cmax)
-                       : a.selected_interacting (braw, cmin, cmax);
-        } else {
-          res = negate ? a.selected_not_interacting (b, cmin, cmax)
-                       : a.selected_interacting (b, cmin, cmax);
-        }
       }
-      m_regions[d.name] = res;
+      bool counted = (op != "INSIDE" && op != "OUTSIDE" && op != "CUT" &&
+                      (cmin != 1 || cmax != std::numeric_limits<size_t>::max ()));
+
+      //  the select as a pure function of (a, b): every branch selects WHOLE a
+      //  polygons (or, for negated CUT, the point-local a - cut). Identical to the
+      //  flat code below; a tile hands it whole a polygons touching the core plus
+      //  every b polygon touching those, so each polygon's verdict is unchanged.
+      auto apply_select = [op, negate, cmin, cmax] (const db::Region &a, const db::Region &b) -> db::Region {
+        if (op == "INSIDE") {
+          return negate ? a.selected_not_inside (b) : a.selected_inside (b);
+        } else if (op == "OUTSIDE") {
+          return negate ? a.selected_not_outside (b) : a.selected_outside (b);
+        } else if (op == "CUT") {
+          //  Calibre CUT A B: polygons of A that STRADDLE B's boundary (overlap
+          //  area yet not wholly inside). Overlapping-minus-wholly-inside == the
+          //  true straddle set (empty for a foundry-clean cell).
+          db::Region cut = a.selected_overlapping (b).selected_not_inside (b);
+          return negate ? (a - cut) : cut;
+        } else {
+          //  INTERACT / TOUCH / ENCLOSE. Counted qualifier counts the OTHER layer's
+          //  ORIGINAL (unmerged) polygons -- KLayout would otherwise union the 4
+          //  EXPAND-EDGE strips of a square into one ring and ==4 never matches.
+          if (cmin != 1 || cmax != std::numeric_limits<size_t>::max ()) {
+            db::Region braw (b);
+            braw.set_merged_semantics (false);
+            return negate ? a.selected_not_interacting (braw, cmin, cmax)
+                          : a.selected_interacting (braw, cmin, cmax);
+          }
+          return negate ? a.selected_not_interacting (b, cmin, cmax)
+                        : a.selected_interacting (b, cmin, cmax);
+        }
+      };
+
+      if (deriv_tile_enabled (DTC_SELECT) && m_threads > 1 && m_deriv_pool_width <= 1
+          && ! counted && ! d.operands.empty ()) {
+        const db::Region &a_full = resolve (d.operands[0]);
+        bool has_b = d.operands.size () > 1;
+        db::Region empty_b;
+        const db::Region &b_full = has_b ? resolve (d.operands[1]) : empty_b;
+        db::Box bb = a_full.bbox ();
+        //  whole-shape halo: pick the WHOLE a polygons touching each disjoint core,
+        //  then every b polygon touching those a polygons -> each a polygon's
+        //  verdict is exactly the flat one. Union + merge dedups polygons a polygon
+        //  reached from >1 core.
+        m_regions[d.name] = tiled_region_build (bb, 0, false,
+          [&a_full, &b_full, has_b, &apply_select] (const db::Box &core, const db::Box &) -> db::Region {
+            db::Region a_i = a_full.selected_interacting (db::Region (core));
+            if (a_i.empty ()) { return db::Region (); }
+            db::Region b_i = has_b ? b_full.selected_interacting (a_i) : db::Region ();
+            return apply_select (a_i, b_i);
+          });
+      } else {
+        db::Region a = resolve (d.operands[0]);
+        db::Region b = d.operands.size () > 1 ? resolve (d.operands[1]) : db::Region ();
+        m_regions[d.name] = apply_select (a, b);
+      }
     } else if (k == "passthrough") {
       m_regions[d.name] = resolve (d.operands[0]);
     } else if (k == "empty") {
@@ -1724,7 +1895,7 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d,
       m_regions[d.name] = rectangles_of (d);
     } else if (k == "layout_extent") {
       //  nullary EXTENT = the LAYOUT extent (bbox of the top cell over all
-      //  layers). Distinct from the per-shape EXTENTS op below. commercial-PDK's
+      //  layers). Distinct from the per-shape EXTENTS op below. The commercial deck's
       //  SUB=EXTENT seeds the whole BULK/LV context tree from this.
       m_regions[d.name] = db::Region (m_layout.cell (m_top).bbox ());
     } else if (k == "extents") {
@@ -1741,7 +1912,7 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d,
       //  the operand may be an EDGE-typed derivation (e.g. an ANGLE
       //  selection): resolve() only consults the REGION table, so an edge
       //  operand silently became empty and every EXPAND EDGE chain
-      //  collapsed (commercial-PDK a contact-orientation rule). as_edges() consults the edge table
+      //  collapsed (a commercial contact-orientation rule). as_edges() consults the edge table
       //  first and falls back to region.edges().
       db::Edges edges = as_edges (d.operands[0]);
       db::Coord w = to_dbu (std::fabs (d.has_value ? d.value : 0.0));
@@ -1825,7 +1996,7 @@ db::EdgesCheckOptions SVRFEngine::edge_check_options (const SVRFRule &r) const
 //  distance 0. Drop pairs whose edges are parallel AND intersecting (parallel
 //  edges can only intersect when collinear-overlapping); endpoint abutments
 //  at an angle stay (that is what ABUT<n / ignore_angle governs).
-//  On the commercial-PDK full-FEOL spm GDS this phantom class alone accounted for
+//  On the full-FEOL spm GDS this phantom class alone accounted for
 //  the per-cell-count families (imp enclosure x1069, NPSD/PPSD waves, ...).
 //  Projection overlap of two PARALLEL edges along a's direction, in
 //  (unnormalized but internally consistent) projected scalar units. Only the
@@ -2342,6 +2513,228 @@ SVRFEngine::tiled_check (TiledKind kind, const db::Region &pa, const db::Region 
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+//  Route B, Phase 3: spatial tiling of the giant single DERIVATION ops
+// ---------------------------------------------------------------------------
+
+bool SVRFEngine::deriv_tile_enabled (DerivTileClass c) const
+{
+  //  master off switch first (SVRFDRC_TILE_DERIV=0 disables all derivation tiling)
+  if (const char *m = getenv ("SVRFDRC_TILE_DERIV")) {
+    if (atoi (m) == 0) { return false; }
+  }
+  const char *e = 0;
+  switch (c) {
+    case DTC_BOOL:   e = getenv ("SVRFDRC_TILE_DERIV_BOOL");   break;
+    case DTC_SIZE:   e = getenv ("SVRFDRC_TILE_DERIV_SIZE");   break;
+    case DTC_SELECT: e = getenv ("SVRFDRC_TILE_DERIV_SELECT"); break;
+  }
+  if (e) {
+    return atoi (e) > 0;                 // explicit override for this class
+  }
+  return true;                           // default on (call sites also gate on m_threads>1)
+}
+
+bool SVRFEngine::is_big_tileable_deriv (const SVRFDerivation &d)
+{
+  if (m_threads <= 1 || d.edge_typed || ! d.supported) {
+    return false;
+  }
+  DerivTileClass c;
+  const std::string &k = d.kind;
+  if (k == "bool" || k == "bool_expr") { c = DTC_BOOL; }
+  else if (k == "size")                { c = DTC_SIZE; }
+  else if (k == "select")              { c = DTC_SELECT; }
+  else                                 { return false; }
+  if (! deriv_tile_enabled (c)) {
+    return false;
+  }
+  std::size_t big = 4000;                // merged-polygon count threshold (tunable)
+  if (const char *e = getenv ("SVRFDRC_TILE_DERIV_BIG")) {
+    long v = atol (e);
+    if (v > 0) { big = (std::size_t) v; }
+  }
+  //  the largest input operand decides: a giant full-chip op has a big operand.
+  //  Inputs are prewarmed (execute_leveled::prewarm_names before this runs), so
+  //  count() reads the warm merged cache -- cheap.
+  std::set<std::string> refs = derivation_refs (d);
+  std::size_t maxc = 0;
+  for (std::set<std::string>::const_iterator n = refs.begin (); n != refs.end (); ++n) {
+    std::map<std::string, db::Region>::iterator it = m_regions.find (*n);
+    if (it != m_regions.end ()) {
+      std::size_t cnt = it->second.count ();
+      if (cnt > maxc) { maxc = cnt; }
+      if (maxc >= big) { return true; }
+    }
+  }
+  return maxc >= big;
+}
+
+db::Region
+SVRFEngine::tiled_region_build (const db::Box &bb, db::Coord border, bool clip_to_core,
+                                const std::function<db::Region (const db::Box &, const db::Box &)> &per_tile) const
+{
+  if (bb.empty ()) {
+    return db::Region ();
+  }
+
+  //  (0) tile-thread budget: never oversubscribe past m_threads when this op is one
+  //  of several on the op-level derivation pool. m_deriv_pool_width<=1 => the op is
+  //  running alone (main thread) and may claim every core.
+  int pool = (m_deriv_pool_width > 0 ? m_deriv_pool_width : 1);
+  int nw = (m_threads > 0 ? m_threads : 1) / pool;
+  if (nw < 1) {
+    nw = 1;
+  }
+
+  //  (1) grid: aim for ~4x tiles per tile-thread so the dynamic-grab pool load-
+  //  balances the giant op (a few oversized tiles would leave threads idle at the
+  //  tail). SVRFDRC_TILE_DERIV_GRID=N forces N tiles/axis (stress test).
+  int per;
+  if (const char *g = getenv ("SVRFDRC_TILE_DERIV_GRID")) {
+    per = atoi (g);
+    if (per < 1) { per = 1; }
+  } else {
+    per = (int) std::ceil (std::sqrt (4.0 * (double) std::max (1, nw)));
+    if (per < 1) { per = 1; }
+  }
+  int nx = per, ny = per;
+
+  //  don't cut a tile below ~4*border (the halo overhead would dominate and buy no
+  //  parallelism). For point-local booleans border==0 so this never clamps.
+  long long minspan = (long long) border * 4 + 1;
+  while (nx > 1 && ((long long) bb.width () / nx) < minspan) { nx -= 1; }
+  while (ny > 1 && ((long long) bb.height () / ny) < minspan) { ny -= 1; }
+
+  std::vector<db::Box> cores;
+  cores.reserve ((std::size_t) nx * (std::size_t) ny);
+  const db::Coord x0 = bb.left (), y0 = bb.bottom ();
+  const long long W = bb.width (), H = bb.height ();
+  for (int iy = 0; iy < ny; ++iy) {
+    db::Coord cy0 = (db::Coord) (y0 + (H * iy) / ny);
+    db::Coord cy1 = (iy + 1 == ny) ? bb.top () : (db::Coord) (y0 + (H * (iy + 1)) / ny);
+    for (int ix = 0; ix < nx; ++ix) {
+      db::Coord cx0 = (db::Coord) (x0 + (W * ix) / nx);
+      db::Coord cx1 = (ix + 1 == nx) ? bb.right () : (db::Coord) (x0 + (W * (ix + 1)) / nx);
+      cores.push_back (db::Box (cx0, cy0, cx1, cy1));
+    }
+  }
+  const std::size_t ntiles = cores.size ();
+
+  //  (2) per-tile build into a private slot (no shared mutable structure -> the
+  //  result is deterministic for any thread count / grid).
+  std::vector<db::Region> per_tile_out (ntiles);
+  const db::Vector bvec (border, border);
+  auto do_tile = [&] (std::size_t i) {
+    db::Box halo = cores[i].enlarged (bvec);
+    db::Region r = per_tile (cores[i], halo);
+    if (clip_to_core) {
+      r &= db::Region (cores[i]);        // finite-reach: keep only this core's share
+    }
+    per_tile_out[i] = r;
+  };
+
+  if ((std::size_t) nw > ntiles) {
+    nw = (int) ntiles;
+  }
+  if (nw <= 1 || ntiles <= 1) {
+    for (std::size_t i = 0; i < ntiles; ++i) {
+      do_tile (i);
+    }
+  } else {
+    std::atomic<std::size_t> next (0);
+    std::vector<std::unique_ptr<SVRFFnThread> > workers;
+    workers.reserve ((std::size_t) nw);
+    for (int t = 0; t < nw; ++t) {
+      SVRFFnThread *w = new SVRFFnThread ();
+      w->fn = [&do_tile, &next, ntiles] () {
+        for (;;) {
+          std::size_t i = next.fetch_add (1, std::memory_order_relaxed);
+          if (i >= ntiles) {
+            break;
+          }
+          do_tile (i);
+        }
+      };
+      workers.push_back (std::unique_ptr<SVRFFnThread> (w));
+    }
+    for (int t = 0; t < nw; ++t) { workers[t]->start (); }
+    for (int t = 0; t < nw; ++t) { workers[t]->wait (); }
+  }
+
+  //  (3) stitch: raw-insert every tile's polygons then merge ONCE. The point set is
+  //  exactly the flat op's; merge() collapses it to the canonical polygon set, so
+  //  the stored geometry is byte-identical to the flat derivation (bool/size tiles
+  //  are disjoint after the core clip -> the merge only stitches boundary
+  //  fragments; select tiles share whole polygons -> the merge dedups them).
+  db::Region out;
+  for (std::size_t i = 0; i < ntiles; ++i) {
+    for (db::Region::const_iterator p = per_tile_out[i].begin (); ! p.at_end (); ++p) {
+      out.insert (*p);
+    }
+  }
+  return out.merged ();
+}
+
+db::Region
+SVRFEngine::eval_bool_expr_r (const std::string &expr,
+                              const std::function<db::Region (const std::string &)> &res)
+{
+  //  Structurally identical recursive descent to eval_bool_expr, but every atom is
+  //  resolved through `res` (a tile hands a clipped-to-core view of each operand).
+  //  Because AND/OR/NOT/XOR are point-local, evaluating the SAME expression on the
+  //  disjoint-core-clipped operands and unioning the tiles reproduces the flat
+  //  result exactly.
+  std::vector<std::string> toks;
+  {
+    std::string cur;
+    for (std::size_t i = 0; i < expr.size (); ++i) {
+      char ch = expr[i];
+      if (ch == '(' || ch == ')') {
+        if (! cur.empty ()) { toks.push_back (cur); cur.clear (); }
+        toks.push_back (std::string (1, ch));
+      } else if (std::isspace ((unsigned char) ch)) {
+        if (! cur.empty ()) { toks.push_back (cur); cur.clear (); }
+      } else {
+        cur += ch;
+      }
+    }
+    if (! cur.empty ()) { toks.push_back (cur); }
+  }
+
+  std::size_t pos = 0;
+  std::function<db::Region ()> expression;
+  std::function<db::Region ()> atom = [&] () -> db::Region {
+    if (pos < toks.size () && toks[pos] == "(") {
+      pos += 1;
+      db::Region v = expression ();
+      if (pos < toks.size () && toks[pos] == ")") { pos += 1; }
+      return v;
+    }
+    std::string t = toks[pos];
+    pos += 1;
+    return res (t);
+  };
+  auto upper = [] (std::string s) { for (char &c : s) c = (char) std::toupper ((unsigned char) c); return s; };
+  expression = [&] () -> db::Region {
+    db::Region val = atom ();
+    while (pos < toks.size ()) {
+      std::string u = upper (toks[pos]);
+      if (u != "AND" && u != "OR" && u != "NOT" && u != "XOR") {
+        break;
+      }
+      pos += 1;
+      db::Region rhs = atom ();
+      if (u == "AND") { val &= rhs; }
+      else if (u == "OR") { val |= rhs; }
+      else if (u == "NOT") { val -= rhs; }
+      else { val ^= rhs; }
+    }
+    return val;
+  };
+  return expression ();
 }
 
 // ---------------------------------------------------------------------------

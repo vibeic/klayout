@@ -90,7 +90,7 @@ static int count_char (const std::string &s, char c)
 
 //  fullmatch [A-Za-z_][\w.$:]* — the ":" admits SVRF temp names
 //  (name:tmp); without it `X:tmp = ...` parses as an assignment to X and
-//  silently OVERWRITES the base layer (commercial-PDK wide-metal chains chains).
+//  silently OVERWRITES the base layer (commercial wide-metal chains).
 static const std::regex &ident_re ()
 {
   static const std::regex re ("[A-Za-z_][\\w.$:]*", std::regex::ECMAScript);
@@ -689,7 +689,7 @@ static SVRFDerivation parse_derivation (const std::string &name, const std::stri
       }
       //  one-sided qualifier (SHRINK X RIGHT BY 5 ...). Treating it as an
       //  isotropic size silently corrupts every wide-metal derivation
-      //  (commercial-PDK wide-metal chains chains) — the exact one-sided form is
+      //  (commercial wide-metal chains) — the exact one-sided form is
       //  a half-size on that axis plus a half translation (erosion/dilation
       //  by an off-center segment), applied in the engine.
       //  Decks NEST these on ONE line — SHRINK(SHRINK(SHRINK(SHRINK X R 5)
@@ -863,7 +863,7 @@ static SVRFDerivation parse_derivation (const std::string &name, const std::stri
       d.params["negate"] = has ("NOT") ? "1" : "0";
       //  SVRF interaction-count qualifier: `INTERACT A B ==N / >N / <N`.
       //  Dropping the count made every counted INTERACT behave uncounted —
-      //  commercial-PDK a contact-orientation rule selects contacts interacting with EXACTLY 4
+      //  A commercial contact-orientation rule selects contacts interacting with EXACTLY 4
       //  rectilinear-edge strips, so the uncounted form mislabels every
       //  square contact in the design (15632/15632 false-flagged). Strict
       //  bounds fold to the integral count in the engine (>N -> N+1,
@@ -911,7 +911,7 @@ static SVRFDerivation parse_derivation (const std::string &name, const std::stri
       //  ONE construct: edges NOT strictly inside (0,90). Ignoring the NOT
       //  (and the strictness) turned it into "edges strictly inside (0,90)"
       //  — for a rectilinear layout that is the EMPTY set, so every
-      //  derivation chained on it silently collapsed (commercial-PDK a contact-orientation rule).
+      //  derivation chained on it silently collapsed (a commercial contact-orientation rule).
       d.params["negate"] = has ("NOT") ? "1" : "0";
       {
         bool lo_strict = false, hi_strict = false;
@@ -937,7 +937,7 @@ static SVRFDerivation parse_derivation (const std::string &name, const std::stri
   //  the bbox of everything — NOT the per-shape EXTENTS op. Must precede
   //  the bare-identifier passthrough: `EXTENT` alone used to resolve as an
   //  undefined layer named EXTENT -> silently empty -> every BULK/LV
-  //  context derived from it collapsed (commercial-PDK: SUB=EXTENT empty made
+  //  context derived from it collapsed (commercial deck: SUB=EXTENT empty made
   //  POhv.S.5 fire 15420x on plain LV std cells).
   if (up.size () == 1 && (up[0] == "EXTENT" || up[0] == "EXTENTS")) {
     d.kind = "layout_extent";

@@ -147,6 +147,15 @@ private:
   //  worker reads), read by the tiled checks -> no concurrent write during reads.
   int m_rule_pool_width = 0;
 
+  //  -- Route B, Phase 3: spatial tiling of the giant single DERIVATION ops --
+  //  Width of the CURRENTLY-active DERIVATION-level worker pool as seen by a
+  //  tiled derivation op (0 or 1 = the op is running ALONE on the main thread, so
+  //  a tiled build may claim all m_threads; >1 = the op is one of several running
+  //  on the op-level pool, so it must NOT spawn nested tile threads). Written on
+  //  the main thread before the derivation pool starts / after it joins
+  //  (happens-before the worker reads) -> no concurrent write during reads.
+  int m_deriv_pool_width = 0;
+
   //  -- cell-aware FEOL exemption state (fork fix #2) ----------------------
   //  Built ONCE by setup_cell_aware_feol() at the head of execute() and only
   //  READ during the (possibly parallel) rule phase -> safe to share across
@@ -249,6 +258,47 @@ private:
   //  the merged operands (same result, no per-tile halo-select overhead).
   db::EdgePairs tiled_check (TiledKind kind, const db::Region &pa, const db::Region *pb,
                              db::Coord d, const db::RegionCheckOptions &o) const;
+
+  //  -- Route B, Phase 3: spatial tiling of the giant single DERIVATION ops --
+  //  Phases 1/2 tiled the CHECK ops. On a large layout the DRC wall is dominated
+  //  by a FEW enormous full-chip single derivation builds (booleans / sizing /
+  //  select). Phase 3 tiles those, exactly the way Calibre's hyperscaling does:
+  //    * BOOLEANS (AND/OR/NOT/XOR, bool_expr): POINT-LOCAL. Clip every operand to
+  //      a DISJOINT core box (0 halo), evaluate the op on the clipped inputs, and
+  //      stitch by plain union -> trivially byte-identical (each point lands in
+  //      exactly one core).
+  //    * SIZING (SIZE/GROW/SHRINK, one-sided, OVERUNDER/UNDEROVER): FINITE reach =
+  //      the size distance. Gather the WHOLE shapes within `reach` of the core,
+  //      size them, CLIP the result to the disjoint core, union -> byte-identical.
+  //    * SELECT/INTERACT (selected_*): reach = the interaction. Gather the WHOLE a
+  //      polygons touching the core plus every b polygon touching those, run the
+  //      IDENTICAL select, union + merge (whole-shape dedup) -> byte-identical.
+  //  UNBOUNDED ops (DENSITY / connectivity / net / holes / extents / ...) stay on
+  //  the flat serial path. Gated on m_threads>1; --threads=1 is the exact flat
+  //  derivation path (byte-identical to HEAD). Each class also has an env override
+  //  (SVRFDRC_TILE_DERIV[_BOOL|_SIZE|_SELECT]) so a break can be isolated to one
+  //  class without a rebuild.
+  enum DerivTileClass { DTC_BOOL, DTC_SIZE, DTC_SELECT };
+  bool deriv_tile_enabled (DerivTileClass c) const;
+  //  true when d is a tileable-class, env-enabled derivation whose largest input
+  //  operand is big enough (>= SVRFDRC_TILE_DERIV_BIG, default 4000 merged
+  //  polygons) to be worth tiling across the whole pool. Used by
+  //  run_parallel_derivations to pull the giant ops OUT of the op-level pool and
+  //  run each one tiled across all m_threads on the main thread.
+  bool is_big_tileable_deriv (const SVRFDerivation &d);
+  //  Cut `bb` into a disjoint core grid (cores grown by `border` for the halo),
+  //  run `per_tile(core, halo)` on the tile-thread pool (budget
+  //  m_threads/max(1,m_deriv_pool_width)), optionally clip each tile result to its
+  //  core, then raw-union every tile and merge once -> a canonical Region whose
+  //  point set is byte-identical to the flat op. When the budget resolves to a
+  //  single tile thread it runs `per_tile` once over the whole bbox (== flat).
+  db::Region tiled_region_build (const db::Box &bb, db::Coord border, bool clip_to_core,
+                                 const std::function<db::Region (const db::Box &core, const db::Box &halo)> &per_tile) const;
+  //  eval_bool_expr variant that resolves each atom through `res` (used to hand a
+  //  tile a per-operand clipped-to-core view). No `used` out-param: the unmodeled
+  //  propagation is done separately from the operand-name token scan.
+  db::Region eval_bool_expr_r (const std::string &expr,
+                               const std::function<db::Region (const std::string &)> &res);
 
   //  -- parallel measurement-rule phase -----------------------------------
   //  Single-threaded pre-realization: resolve every parallel-rule input on the

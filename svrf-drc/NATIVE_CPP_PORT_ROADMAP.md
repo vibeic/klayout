@@ -113,7 +113,7 @@ buddy binary only.
    Python sparse-checkout. Rewire the plugin touchpoints (`phase3_one_shot_runner
    ._try_svrf_native_drc` → run `svrfdrc`; `_svrfdrc_bin_container` → probe the native
    binary; `drc-fix` SKILL + 2 tests reword). **Verify byte-parity native-vs-Python on the
-   commercial-PDK deck BEFORE deleting Python.** Then remove `svrf_klayout/*.py` + `.lym`. **[DONE]**
+   the commercial deck BEFORE deleting Python.** Then remove `svrf_klayout/*.py` + `.lym`. **[DONE]**
    - **Image `vibeic-eda:0.2.11`** ships the buddy at `/foss/tools/bin/svrfdrc`. Stage-7
      Python source-checkout retired; the runtime install is a **wrapper** (not a bare
      symlink): the buddy's ELF carries `DT_RUNPATH=/foss/tools/klayout-vibeic`, but the
@@ -126,7 +126,7 @@ buddy binary only.
      runtime condition (catches the bug at build time).
    - **★ IN-IMAGE SAFETY GATE PASSED:** the baked wrapper `svrfdrc` (resolved via
      `command -v svrfdrc` exactly as the plugin does, under the real runtime env) run on
-     the REAL commercial-PDK deck + spm sign-off GDS produces a report **byte-identical** to the
+     the REAL commercial deck + spm sign-off GDS produces a report **byte-identical** to the
      retired Python golden — 4,533 verdict lines, all 10 FAIL lines match, tally
      `{'PASS': 4523, 'FAIL': 10}` (only the argv path-echo header line differs, not a
      result). 0.92 s. This cleared Python for deletion.
@@ -144,8 +144,8 @@ buddy binary only.
 
    **★ REAL-DECK PARITY GATE PASSED (the load-bearing safety check for step 4).**
    The native `svrfdrc` buddy binary is **byte-identical** to the reference
-   `run_svrf_drc.py` on the REAL commercial **a commercial foundry commercial-PDK** deck
-   (`the commercial DRC rule deck`, 87,620 lines → 224 layers / 15,897 derivations /
+   `run_svrf_drc.py` on the REAL commercial (NDA) deck
+   (the commercial DRC rule deck, 87,620 lines → 224 layers / 15,897 derivations /
    4,533 rules) run on the spm sign-off GDS — final tally `{'PASS': 4523, 'FAIL': 10}`
    on both sides, empty diff. Buddy: 1.03 s, 100 MB. (Deck is NDA — verified locally,
    never committed; test fixtures here are all SYNTHETIC.)
