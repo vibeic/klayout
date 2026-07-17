@@ -338,34 +338,42 @@ const std::vector<SVRFResult> &SVRFEngine::execute ()
 
   std::vector<std::pair<const SVRFRule *, std::size_t> > parallel;
   std::vector<std::pair<const SVRFRule *, std::size_t> > copies;
-  std::size_t noncopy_rank = 0, copy_rank = 0;
-  for (std::size_t i = 0; i < m_deck.statements.size (); ++i) {
-    const SVRFStatement &st = m_deck.statements[i];
-    if (st.kind == SVRFStatement::Derivation) {
-      exec_derivation (m_deck.derivations[st.index]);
-      continue;
-    }
-    const SVRFRule &r = m_deck.rules[st.index];
-    if (r.op == "COPY") {
-      std::size_t slot = n_noncopy + copy_rank;
-      copy_rank += 1;
-      copies.push_back (std::make_pair (&r, slot));
-      continue;
-    }
-    std::size_t slot = noncopy_rank;
-    noncopy_rank += 1;
-    std::map<std::string, std::size_t>::const_iterator ld = last_deriv_ref.find (r.name);
-    bool consumed_later = (ld != last_deriv_ref.end () && ld->second > i);
-    bool dup_name = (name_count[r.name] > 1);
-    bool main_thread = (m_threads <= 1) ||
-                       consumed_later ||
-                       dup_name ||
-                       (r.op == "DENSITY") ||
-                       (r.connectivity != SVRFConnectivity::none);
-    if (main_thread) {
-      exec_rule (r, slot);                         // inline, at source position
-    } else {
-      parallel.push_back (std::make_pair (&r, slot));
+  if (m_threads > 1) {
+    //  fork fix #3: topological-level DERIVATION parallelism. Fills `parallel` /
+    //  `copies` with the same rule classification as the serial loop below; runs
+    //  the derivations of each level on the worker pool with an inter-level
+    //  barrier and the main-thread rules inline at their level. See execute_leveled.
+    execute_leveled (n_noncopy, name_count, last_deriv_ref, parallel, copies, timing);
+  } else {
+    std::size_t noncopy_rank = 0, copy_rank = 0;
+    for (std::size_t i = 0; i < m_deck.statements.size (); ++i) {
+      const SVRFStatement &st = m_deck.statements[i];
+      if (st.kind == SVRFStatement::Derivation) {
+        exec_derivation (m_deck.derivations[st.index]);
+        continue;
+      }
+      const SVRFRule &r = m_deck.rules[st.index];
+      if (r.op == "COPY") {
+        std::size_t slot = n_noncopy + copy_rank;
+        copy_rank += 1;
+        copies.push_back (std::make_pair (&r, slot));
+        continue;
+      }
+      std::size_t slot = noncopy_rank;
+      noncopy_rank += 1;
+      std::map<std::string, std::size_t>::const_iterator ld = last_deriv_ref.find (r.name);
+      bool consumed_later = (ld != last_deriv_ref.end () && ld->second > i);
+      bool dup_name = (name_count[r.name] > 1);
+      bool main_thread = (m_threads <= 1) ||
+                         consumed_later ||
+                         dup_name ||
+                         (r.op == "DENSITY") ||
+                         (r.connectivity != SVRFConnectivity::none);
+      if (main_thread) {
+        exec_rule (r, slot);                         // inline, at source position
+      } else {
+        parallel.push_back (std::make_pair (&r, slot));
+      }
     }
   }
 
@@ -543,6 +551,323 @@ void SVRFEngine::run_parallel (const std::vector<std::pair<const SVRFRule *, std
   }
   for (int t = 0; t < nw; ++t) {
     workers[t]->wait ();                           // join: happens-before for pass 3
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  topological-level DERIVATION parallelism (fork fix #3)
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+//  The exact set of layer names a derivation reads: its operands PLUS the tokens
+//  of its boolean expr (tokenized the way eval_bool_expr does). This is the
+//  complete set of names exec_derivation() can pass to resolve()/as_edges(), so
+//  prewarming this set guarantees no worker ever structurally mutates m_regions /
+//  m_edges_ns (every resolve is a cache hit). Mirrors the refs computed in
+//  SVRFEngine::execute() for last_deriv_ref.
+static std::set<std::string> derivation_refs (const db::SVRFDerivation &d)
+{
+  std::set<std::string> refs (d.operands.begin (), d.operands.end ());
+  std::string cur;
+  for (std::size_t k = 0; k < d.expr.size (); ++k) {
+    char ch = d.expr[k];
+    if (ch == '(' || ch == ')' || std::isspace ((unsigned char) ch)) {
+      if (! cur.empty ()) { refs.insert (cur); cur.clear (); }
+    } else {
+      cur += ch;
+    }
+  }
+  if (! cur.empty ()) { refs.insert (cur); }
+  return refs;
+}
+
+}
+
+void SVRFEngine::prewarm_names (const std::set<std::string> &names)
+{
+  //  Single-threaded realization of every INPUT a parallel derivation level will
+  //  read: resolve() it (drawing + inserting the map node here, never under a
+  //  worker) and force its lazy merged-polygon + bbox caches valid. Worker copies
+  //  then inherit the filled caches (COW) and only READ shared state. Identical in
+  //  spirit to prewarm_for_parallel() but keyed on a name set (derivation inputs).
+  for (std::set<std::string>::const_iterator n = names.begin (); n != names.end (); ++n) {
+    db::Region &reg = resolve (*n);                 // cache-fill / draw (single-threaded)
+    { db::RegionIterator mi = reg.begin_merged (); (void) mi; }   // fill merged cache
+    reg.bbox ();                                                  // fill bbox cache
+    if (m_edge_layers.count (*n)) {
+      std::map<std::string, db::Edges>::iterator ei = m_edges_ns.find (*n);
+      if (ei != m_edges_ns.end ()) {
+        { db::EdgesIterator me = ei->second.begin_merged (); (void) me; }
+        ei->second.bbox ();
+      }
+    }
+  }
+}
+
+void SVRFEngine::run_parallel_derivations (const std::vector<const SVRFDerivation *> &batch)
+{
+  if (batch.empty ()) {
+    return;
+  }
+  int nw = m_threads;
+  if (nw < 1) {
+    nw = 1;
+  }
+  if ((std::size_t) nw > batch.size ()) {
+    nw = (int) batch.size ();
+  }
+  const std::size_t n = batch.size ();
+  std::atomic<std::size_t> next (0);
+
+  //  Per-worker sinks for the two set-typed side effects, merged single-threaded
+  //  after the join (the level barrier). No worker touches m_unmodeled /
+  //  m_edge_layers structurally -> those sets are frozen (read-only) during the
+  //  level, and every m_regions / m_edges_ns node is pre-created so operator[] only
+  //  ASSIGNS an existing node (a read-only tree traversal + value write to a slot
+  //  no other worker touches). Hence the map structure is immutable and every
+  //  mapped value is single-writer for the duration of the level.
+  std::vector<std::vector<std::string> > unmodeled_sinks ((std::size_t) nw);
+  std::vector<std::vector<std::string> > edge_sinks ((std::size_t) nw);
+
+  std::vector<std::unique_ptr<SVRFFnThread> > workers;
+  workers.reserve ((std::size_t) nw);
+  for (int t = 0; t < nw; ++t) {
+    SVRFFnThread *w = new SVRFFnThread ();
+    std::vector<std::string> *usink = &unmodeled_sinks[(std::size_t) t];
+    std::vector<std::string> *esink = &edge_sinks[(std::size_t) t];
+    w->fn = [this, &batch, &next, n, usink, esink] () {
+      for (;;) {
+        std::size_t i = next.fetch_add (1, std::memory_order_relaxed);
+        if (i >= n) {
+          break;
+        }
+        const SVRFDerivation &d = *batch[i];
+        this->exec_derivation (d, usink, esink);
+        //  Warm THIS derivation's own output caches. The slot is single-writer this
+        //  level (no other worker reads or writes d.name), so filling its mutable
+        //  merged/bbox caches here is race-free AND parallelizes the merge cost --
+        //  the next level's prewarm_names() then hits a warm cache instead of
+        //  merging on the (single-threaded) main thread.
+        std::map<std::string, db::Region>::iterator ri = m_regions.find (d.name);
+        if (ri != m_regions.end ()) {
+          { db::RegionIterator mi = ri->second.begin_merged (); (void) mi; }
+          ri->second.bbox ();
+        }
+        if (d.edge_typed) {
+          std::map<std::string, db::Edges>::iterator ei = m_edges_ns.find (d.name);
+          if (ei != m_edges_ns.end ()) {
+            { db::EdgesIterator me = ei->second.begin_merged (); (void) me; }
+            ei->second.bbox ();
+          }
+        }
+      }
+    };
+    workers.push_back (std::unique_ptr<SVRFFnThread> (w));
+  }
+  for (int t = 0; t < nw; ++t) {
+    workers[t]->start ();
+  }
+  for (int t = 0; t < nw; ++t) {
+    workers[t]->wait ();                           // join: happens-before the merge
+  }
+  //  merge the thread-local sinks into the shared sets (single-threaded)
+  for (int t = 0; t < nw; ++t) {
+    for (std::vector<std::string>::const_iterator s = unmodeled_sinks[(std::size_t) t].begin (); s != unmodeled_sinks[(std::size_t) t].end (); ++s) {
+      m_unmodeled.insert (*s);
+    }
+    for (std::vector<std::string>::const_iterator s = edge_sinks[(std::size_t) t].begin (); s != edge_sinks[(std::size_t) t].end (); ++s) {
+      m_edge_layers.insert (*s);
+    }
+  }
+}
+
+void SVRFEngine::execute_leveled (std::size_t n_noncopy,
+                                  const std::map<std::string, int> &name_count,
+                                  const std::map<std::string, std::size_t> &last_deriv_ref,
+                                  std::vector<std::pair<const SVRFRule *, std::size_t> > &parallel,
+                                  std::vector<std::pair<const SVRFRule *, std::size_t> > &copies,
+                                  bool timing)
+{
+  typedef std::chrono::steady_clock clk;
+  const std::size_t n_stmts = m_deck.statements.size ();
+
+  //  --- (1) fixed source-order report slots ------------------------------
+  //  Assign each rule its frozen report slot in SOURCE order (independent of the
+  //  level execution order), so the byte order of the report is unchanged.
+  std::vector<std::size_t> stmt_slot (n_stmts, 0);
+  {
+    std::size_t nr = 0, cr = 0;
+    for (std::size_t i = 0; i < n_stmts; ++i) {
+      const SVRFStatement &st = m_deck.statements[i];
+      if (st.kind != SVRFStatement::Rule) {
+        continue;
+      }
+      if (m_deck.rules[st.index].op == "COPY") {
+        stmt_slot[i] = n_noncopy + cr;
+        cr += 1;
+      } else {
+        stmt_slot[i] = nr;
+        nr += 1;
+      }
+    }
+  }
+
+  //  --- (2) topological level of every statement -------------------------
+  //  Source order is already a valid topological order (producer precedes
+  //  consumer), so a single forward pass computes level(stmt) = 1 + max level of
+  //  any input layer's producer (drawn / external inputs = level 0). Rules are
+  //  levelled too: a rule that produces an error layer consumed by a later
+  //  derivation lands one level below that derivation, so running the rule inline
+  //  at its level (below) commits the error layer before the consumer's level.
+  std::map<std::string, int> name_level;
+  std::vector<int> stmt_level (n_stmts, 0);
+  int maxlvl = 0;
+  for (std::size_t i = 0; i < n_stmts; ++i) {
+    const SVRFStatement &st = m_deck.statements[i];
+    int L = 0;
+    std::string outname;
+    if (st.kind == SVRFStatement::Derivation) {
+      const SVRFDerivation &d = m_deck.derivations[st.index];
+      std::set<std::string> refs = derivation_refs (d);
+      for (std::set<std::string>::const_iterator r = refs.begin (); r != refs.end (); ++r) {
+        std::map<std::string, int>::const_iterator it = name_level.find (*r);
+        if (it != name_level.end ()) { L = std::max (L, it->second + 1); }
+      }
+      outname = d.name;
+    } else {
+      const SVRFRule &r = m_deck.rules[st.index];
+      if (! r.layer1.empty ()) {
+        std::map<std::string, int>::const_iterator it = name_level.find (r.layer1);
+        if (it != name_level.end ()) { L = std::max (L, it->second + 1); }
+      }
+      if (! r.layer2.empty ()) {
+        std::map<std::string, int>::const_iterator it = name_level.find (r.layer2);
+        if (it != name_level.end ()) { L = std::max (L, it->second + 1); }
+      }
+      outname = r.name;
+    }
+    stmt_level[i] = L;
+    name_level[outname] = L;              // last writer wins (source order => valid)
+    maxlvl = std::max (maxlvl, L);
+  }
+
+  //  --- (3) pre-create every derivation output slot ----------------------
+  //  Workers only ASSIGN their own m_regions / m_edges_ns node; pre-creating all of
+  //  them single-threaded means the map STRUCTURE never mutates under the pool
+  //  (structural std::map insertion is not thread-safe even for distinct keys).
+  //  m_edge_layers is NOT pre-populated: it must gain an edge name only when the
+  //  build SUCCEEDS (mirroring the serial path), so it flows through the sink.
+  for (std::vector<SVRFDerivation>::const_iterator d = m_deck.derivations.begin (); d != m_deck.derivations.end (); ++d) {
+    m_regions[d->name];                   // default-construct the slot
+    if (d->edge_typed) {
+      m_edges_ns[d->name];                // default-construct the edge slot
+    }
+  }
+
+  //  --- (4) bucket statements by level (source order preserved) ----------
+  std::vector<std::vector<std::size_t> > by_level ((std::size_t) maxlvl + 1);
+  for (std::size_t i = 0; i < n_stmts; ++i) {
+    by_level[(std::size_t) stmt_level[i]].push_back (i);
+  }
+
+  //  --- (5) run levels in order; parallel derivations + barrier per level -
+  long long ms_prewarm = 0, ms_pardrv = 0, ms_serialdrv = 0, ms_rules = 0;
+  std::size_t n_par_drv = 0, n_serial_drv = 0;
+  for (int L = 0; L <= maxlvl; ++L) {
+    const std::vector<std::size_t> &lvl = by_level[(std::size_t) L];
+
+    std::vector<const SVRFDerivation *> par_drv;   // parallel-safe derivations
+    std::vector<const SVRFDerivation *> ser_drv;   // serial-class (net_ratio / L2N)
+    std::vector<std::size_t> rule_stmts;           // this level's rule statements
+    std::set<std::string> warm;                    // inputs the parallel batch reads
+    for (std::size_t k = 0; k < lvl.size (); ++k) {
+      const SVRFStatement &st = m_deck.statements[lvl[k]];
+      if (st.kind == SVRFStatement::Derivation) {
+        const SVRFDerivation &d = m_deck.derivations[st.index];
+        //  net_ratio builds the shared LayoutToNetlist (mutates m_l2n*) -> keep it
+        //  on the main thread. Everything else only reads its inputs + writes its
+        //  own slot, so it is pool-safe.
+        if (d.kind == "net_ratio") {
+          ser_drv.push_back (&d);
+        } else {
+          par_drv.push_back (&d);
+          std::set<std::string> refs = derivation_refs (d);
+          warm.insert (refs.begin (), refs.end ());
+        }
+      } else {
+        rule_stmts.push_back (lvl[k]);
+      }
+    }
+
+    //  (5a) realize every input this level's parallel derivations will read
+    clk::time_point a0 = clk::now ();
+    prewarm_names (warm);
+    clk::time_point a1 = clk::now ();
+
+    //  (5b) serial-class derivations inline (single-threaded, before the pool)
+    for (std::size_t k = 0; k < ser_drv.size (); ++k) {
+      exec_derivation (*ser_drv[k]);       // nullptr sinks: direct set inserts, safe
+    }
+    clk::time_point a2 = clk::now ();
+
+    //  (5c) parallel-class derivations on the worker pool (barrier on return)
+    run_parallel_derivations (par_drv);
+    clk::time_point a3 = clk::now ();
+
+    //  (5d) this level's rules, classified exactly as the serial loop. main-thread
+    //  rules run inline NOW (their error layer is committed before any higher-level
+    //  consumer); the rest defer to the #1 parallel-rule pass / COPY pass.
+    for (std::size_t k = 0; k < rule_stmts.size (); ++k) {
+      std::size_t i = rule_stmts[k];
+      const SVRFRule &r = m_deck.rules[m_deck.statements[i].index];
+      std::size_t slot = stmt_slot[i];
+      if (r.op == "COPY") {
+        copies.push_back (std::make_pair (&r, slot));
+        continue;
+      }
+      std::map<std::string, std::size_t>::const_iterator ld = last_deriv_ref.find (r.name);
+      bool consumed_later = (ld != last_deriv_ref.end () && ld->second > i);
+      std::map<std::string, int>::const_iterator nc = name_count.find (r.name);
+      bool dup_name = (nc != name_count.end () && nc->second > 1);
+      bool main_thread = consumed_later ||       // m_threads>1 here (>1 gate in caller)
+                         dup_name ||
+                         (r.op == "DENSITY") ||
+                         (r.connectivity != SVRFConnectivity::none);
+      if (main_thread) {
+        exec_rule (r, slot);
+      } else {
+        parallel.push_back (std::make_pair (&r, slot));
+      }
+    }
+    clk::time_point a4 = clk::now ();
+
+    ms_prewarm   += std::chrono::duration_cast<std::chrono::milliseconds> (a1 - a0).count ();
+    ms_serialdrv += std::chrono::duration_cast<std::chrono::milliseconds> (a2 - a1).count ();
+    ms_pardrv    += std::chrono::duration_cast<std::chrono::milliseconds> (a3 - a2).count ();
+    ms_rules     += std::chrono::duration_cast<std::chrono::milliseconds> (a4 - a3).count ();
+    n_par_drv    += par_drv.size ();
+    n_serial_drv += ser_drv.size ();
+  }
+
+  //  Deferred rule vectors are collected in level order; their execution is
+  //  order-independent (each writes its own fixed slot, no rule reads another
+  //  rule's output), but sort by slot so the dispatch order matches the serial
+  //  path's source order exactly (defensive determinism).
+  std::sort (parallel.begin (), parallel.end (),
+             [] (const std::pair<const SVRFRule *, std::size_t> &a,
+                 const std::pair<const SVRFRule *, std::size_t> &b) { return a.second < b.second; });
+  std::sort (copies.begin (), copies.end (),
+             [] (const std::pair<const SVRFRule *, std::size_t> &a,
+                 const std::pair<const SVRFRule *, std::size_t> &b) { return a.second < b.second; });
+
+  if (timing) {
+    fprintf (stderr,
+             "SVRFDRC_TIMING [live] leveled derivations: levels=%d  par_derivs=%zu  serial_derivs=%zu  "
+             "prewarm=%lldms  parallel-build=%lldms  serial-build=%lldms  inline-rules=%lldms\n",
+             maxlvl + 1, n_par_drv, n_serial_drv,
+             ms_prewarm, ms_pardrv, ms_serialdrv, ms_rules);
   }
 }
 
@@ -1152,10 +1477,22 @@ db::Edges SVRFEngine::build_edges (const SVRFDerivation &d)
   return base.edges ();
 }
 
-void SVRFEngine::exec_derivation (const SVRFDerivation &d)
+void SVRFEngine::exec_derivation (const SVRFDerivation &d,
+                                  std::vector<std::string> *unmodeled_sink,
+                                  std::vector<std::string> *edge_layer_sink)
 {
+  //  Set-typed side effects go to a thread-local sink when running under the
+  //  derivation-parallel pool (merged into the shared std::set single-threaded at
+  //  the level barrier), or straight into the shared set on the serial path. The
+  //  serial (nullptr-sink) branch is the original in-place insert -> byte-identical.
+  auto mark_unmodeled = [&] (const std::string &nm) {
+    if (unmodeled_sink) { unmodeled_sink->push_back (nm); } else { m_unmodeled.insert (nm); }
+  };
+  auto mark_edge_layer = [&] (const std::string &nm) {
+    if (edge_layer_sink) { edge_layer_sink->push_back (nm); } else { m_edge_layers.insert (nm); }
+  };
   if (! d.supported) {
-    m_unmodeled.insert (d.name);
+    mark_unmodeled (d.name);
     m_regions[d.name] = db::Region ();
     //  SVRFDRC_DEBUG=1: name every unsupported derivation + the parser's
     //  reason on stderr — the only way to see WHY a chain collapsed without
@@ -1169,10 +1506,10 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d)
   if (d.edge_typed) {
     try {
       m_edges_ns[d.name] = build_edges (d);
-      m_edge_layers.insert (d.name);
+      mark_edge_layer (d.name);
       m_regions[d.name] = db::Region ();     // placeholder for region-typed consumers
     } catch (...) {
-      m_unmodeled.insert (d.name);
+      mark_unmodeled (d.name);
       m_regions[d.name] = db::Region ();
     }
     return;
@@ -1184,7 +1521,11 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d)
       db::Region reg = eval_bool_expr (d.expr, used);
       m_regions[d.name] = reg;
       for (std::vector<std::string>::iterator u = used.begin (); u != used.end (); ++u) {
-        if (m_unmodeled.count (*u)) { m_unmodeled.insert (d.name); break; }
+        //  READ of m_unmodeled is safe under the pool: `used` operands are lower-
+        //  level layers whose unmodeled status was committed at a prior barrier;
+        //  the shared set is never structurally mutated during a level (writes go
+        //  to the thread-local sink), so no reader races a writer.
+        if (m_unmodeled.count (*u)) { mark_unmodeled (d.name); break; }
       }
     } else if (k == "bool") {
       db::Region acc = resolve (d.operands[0]);
@@ -1361,13 +1702,13 @@ void SVRFEngine::exec_derivation (const SVRFDerivation &d)
     } else if (k == "net_ratio") {
       m_regions[d.name] = net_area_ratio (d);
     } else {
-      m_unmodeled.insert (d.name);
+      mark_unmodeled (d.name);
       m_regions[d.name] = db::Region ();
     }
   } catch (...) {
     //  an unsupported/failed derivation -> empty region + unmodeled (dependent
     //  rules honestly SKIP rather than false-PASS)
-    m_unmodeled.insert (d.name);
+    mark_unmodeled (d.name);
     m_regions[d.name] = db::Region ();
   }
 }

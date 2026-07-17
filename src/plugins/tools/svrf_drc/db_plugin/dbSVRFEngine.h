@@ -172,7 +172,15 @@ private:
   db::Coord to_dbu (double um) const;
 
   //  -- derivations (Engine._exec_derivation and helpers) ------------------
-  void exec_derivation (const SVRFDerivation &d);
+  //  When run on a worker thread (derivation-parallel phase) the two set-typed
+  //  side effects (m_unmodeled / m_edge_layers structural inserts) MUST NOT touch
+  //  the shared std::set concurrently. Pass per-worker sinks: the names are pushed
+  //  to the sink (a thread-local vector) and merged into the shared set single-
+  //  threaded at the level barrier. nullptr sinks (the serial threads<=1 path)
+  //  reproduce the exact in-place set inserts -> byte-identical.
+  void exec_derivation (const SVRFDerivation &d,
+                        std::vector<std::string> *unmodeled_sink = 0,
+                        std::vector<std::string> *edge_layer_sink = 0);
   db::Region eval_bool_expr (const std::string &expr, std::vector<std::string> &used);
   db::Region metric_select (const SVRFDerivation &d);
   db::Region rectangles_of (const SVRFDerivation &d);
@@ -201,6 +209,38 @@ private:
   //  Dispatch the pre-realized rules across m_threads workers (dynamic grab via
   //  an atomic index). Each worker calls exec_rule(r, slot) into its own slot.
   void run_parallel (const std::vector<std::pair<const SVRFRule *, std::size_t> > &par);
+
+  //  -- topological-level DERIVATION parallelism (fork fix #3) -------------
+  //  Extends #1 (rule-check threading) to the DOMINANT serial cost: the ~15911
+  //  derivation builds. The derivations + the rule error layers they consume form
+  //  a data-dependency DAG (a statement reads layers produced by earlier ones).
+  //  execute_leveled() topologically LEVELS every statement (level 0 = reads only
+  //  drawn layers; level k reads only levels <k), then for each level runs the
+  //  DERIVATIONS of that level in PARALLEL on the #1 worker pool (an inter-level
+  //  BARRIER guarantees producers finish before consumers start) while running the
+  //  RULES of that level exactly as the serial path would (main-thread inline, or
+  //  deferred to the #1 parallel-rule pass / COPY pass -- filled into `parallel` /
+  //  `copies`). Only entered when m_threads>1; the threads<=1 path is the original
+  //  serial source-order loop, byte-identical to HEAD. The parallel path writes the
+  //  identical m_results for any thread count (every layer is deterministic in its
+  //  committed lower-level inputs; report slots are fixed source-order ranks).
+  void execute_leveled (std::size_t n_noncopy,
+                        const std::map<std::string, int> &name_count,
+                        const std::map<std::string, std::size_t> &last_deriv_ref,
+                        std::vector<std::pair<const SVRFRule *, std::size_t> > &parallel,
+                        std::vector<std::pair<const SVRFRule *, std::size_t> > &copies,
+                        bool timing);
+  //  Single-threaded realization of a set of INPUT layer names before a parallel
+  //  derivation level: resolve() each (so std::map is never structurally mutated
+  //  under workers) and force its lazy merged/bbox caches valid (so worker copies
+  //  only READ already-filled state). Region names warm m_regions[name]; edge-typed
+  //  names additionally warm the stored m_edges_ns[name].
+  void prewarm_names (const std::set<std::string> &names);
+  //  Dispatch a batch of mutually-independent (same-level) derivations across the
+  //  worker pool; each worker executes exec_derivation() into its own pre-created
+  //  m_regions/m_edges_ns slot with a thread-local unmodeled/edge sink, then warms
+  //  its own output. Sinks are merged into the shared sets single-threaded on join.
+  void run_parallel_derivations (const std::vector<const SVRFDerivation *> &batch);
 
   //  -- cell-aware FEOL exemption (fork fix #2) ----------------------------
   //  Parse the config, read the master library GDS + DEF, and build the exact
