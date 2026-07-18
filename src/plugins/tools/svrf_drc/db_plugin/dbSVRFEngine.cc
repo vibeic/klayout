@@ -267,6 +267,12 @@ const std::vector<SVRFResult> &SVRFEngine::execute ()
   //  footprint index is fully built (and never mutated) during the rule phase.
   setup_cell_aware_feol ();
 
+  //  --- automated waiver management (#10) --------------------------------
+  //  Load the pre-approved geometric waivers ONCE here (single-threaded) from
+  //  $SVRFDRC_WAIVERS so the rule phase only READS m_waivers. No env => no-op
+  //  (m_waivers_enabled stays false) => byte-identical to HEAD.
+  load_waivers ();
+
   //  --- result-slot layout (frozen report order) -------------------------
   //  Report lines are: [ every non-COPY rule in source order ] followed by
   //  [ every COPY rule in source order ]. Assign each rule a fixed slot in that
@@ -462,6 +468,11 @@ const std::vector<SVRFResult> &SVRFEngine::execute ()
       fprintf (stderr, "DUMP failed: %s\n", e.what ());
     }
   }
+  //  emit the waiver audit trail (no-op when nothing was waived).
+  flush_waiver_audit ();
+  //  DFM scoring (#47): advisory weighted aggregate over soft rules (no-op
+  //  unless $SVRFDRC_DFM_WEIGHTS is set). Post-processing -> no rule verdicts move.
+  compute_dfm_score ();
   return m_results;
 }
 
@@ -2800,6 +2811,10 @@ void SVRFEngine::exec_rule (const SVRFRule &r, std::size_t slot)
     antenna_check (r, slot);           // native in-engine staged antenna (fork #20)
     return;
   }
+  if (r.op == "PROPERTY") {
+    exec_property (r, slot);           // eqDRC (#8): equation-based per-shape check
+    return;
+  }
 
   db::Coord d = to_dbu (r.value);
   db::EdgePairs ep;
@@ -2920,6 +2935,10 @@ void SVRFEngine::exec_rule (const SVRFRule &r, std::size_t slot)
     viol.clear ();
     ep.polygons (viol);
   }
+  //  automated waiver management (#10): geometry-anchored suppression of
+  //  pre-approved markers (no-op unless $SVRFDRC_WAIVERS names a waiver file).
+  std::size_t waived = 0;
+  maybe_apply_waivers (r, ep, have_ep, viol, waived);
   size_t cnt = have_ep ? ep.count () : viol.count ();
   if (cnt > 0 && getenv ("SVRFDRC_VIOBBOX")) {
     int nb = 0;
@@ -2935,6 +2954,357 @@ void SVRFEngine::exec_rule (const SVRFRule &r, std::size_t slot)
   res.verdict = cnt == 0 ? "PASS" : "FAIL";
   res.info = std::to_string (cnt);
   m_results[slot] = res;
+}
+
+// ---------------------------------------------------------------------------
+//  eqDRC (#8): equation-based DRC -- a small property expression evaluator
+// ---------------------------------------------------------------------------
+
+namespace {
+
+//  Tokenize a property expression into identifiers / numbers / operators.
+//  Literals are plain decimals (no exponent form -- '-' is always an operator).
+static std::vector<std::string> prop_tokens (const std::string &expr)
+{
+  std::vector<std::string> out;
+  size_t i = 0, n = expr.size ();
+  while (i < n) {
+    char c = expr[i];
+    if (isspace ((unsigned char) c)) { ++i; continue; }
+    if (c == '(' || c == ')' || c == '+' || c == '-' || c == '*' || c == '/') {
+      out.push_back (std::string (1, c)); ++i; continue;
+    }
+    size_t j = i;
+    while (j < n) {
+      char d = expr[j];
+      if (isspace ((unsigned char) d) || d == '(' || d == ')' ||
+          d == '+' || d == '-' || d == '*' || d == '/') break;
+      ++j;
+    }
+    out.push_back (expr.substr (i, j - i));
+    i = j;
+  }
+  return out;
+}
+
+//  Recursive-descent evaluator with the usual precedence:
+//    expr   := term (('+'|'-') term)*
+//    term   := factor (('*'|'/') factor)*
+//    factor := number | property | '(' expr ')' | ('+'|'-') factor
+//  On any structural error (unbalanced paren, unknown token, divide-by-zero)
+//  the `ok` flag is cleared and evaluation returns 0.
+struct PropEval
+{
+  const std::vector<std::string> &tok;
+  size_t pos;
+  double area, perim, w, h;
+  bool ok;
+  PropEval (const std::vector<std::string> &t, double a, double p, double ww, double hh)
+    : tok (t), pos (0), area (a), perim (p), w (ww), h (hh), ok (true) { }
+
+  const std::string *peek () const { return pos < tok.size () ? &tok[pos] : 0; }
+
+  double parse_expr ()
+  {
+    double v = parse_term ();
+    while (ok) {
+      const std::string *t = peek ();
+      if (! t) break;
+      if (*t == "+") { ++pos; v += parse_term (); }
+      else if (*t == "-") { ++pos; v -= parse_term (); }
+      else break;
+    }
+    return v;
+  }
+  double parse_term ()
+  {
+    double v = parse_factor ();
+    while (ok) {
+      const std::string *t = peek ();
+      if (! t) break;
+      if (*t == "*") { ++pos; v *= parse_factor (); }
+      else if (*t == "/") { ++pos; double d = parse_factor (); if (d == 0.0) { ok = false; return 0.0; } v /= d; }
+      else break;
+    }
+    return v;
+  }
+  double parse_factor ()
+  {
+    if (pos >= tok.size ()) { ok = false; return 0.0; }
+    const std::string &t = tok[pos++];
+    if (t == "(") {
+      double v = parse_expr ();
+      if (pos >= tok.size () || tok[pos] != ")") { ok = false; return 0.0; }
+      ++pos;
+      return v;
+    }
+    if (t == "-") return -parse_factor ();
+    if (t == "+") return parse_factor ();
+    if (t == ")" || t == "*" || t == "/") { ok = false; return 0.0; }
+    std::string up;
+    up.reserve (t.size ());
+    for (size_t k = 0; k < t.size (); ++k) up.push_back ((char) toupper ((unsigned char) t[k]));
+    if (up == "AREA") return area;
+    if (up == "PERIMETER" || up == "PERIM") return perim;
+    if (up == "WIDTH") return w;
+    if (up == "HEIGHT") return h;
+    char *end = 0;
+    double d = strtod (t.c_str (), &end);
+    if (end && *end == '\0' && end != t.c_str ()) return d;
+    ok = false;
+    return 0.0;
+  }
+};
+
+} // namespace
+
+double SVRFEngine::eval_prop_expr (const std::string &expr, double area, double perim,
+                                   double w, double h, bool &ok)
+{
+  std::vector<std::string> tok = prop_tokens (expr);
+  if (tok.empty ()) { ok = false; return 0.0; }
+  PropEval ev (tok, area, perim, w, h);
+  double v = ev.parse_expr ();
+  if (! ev.ok || ev.pos != tok.size ()) { ok = false; return 0.0; }
+  ok = true;
+  return v;
+}
+
+void SVRFEngine::exec_property (const SVRFRule &r, std::size_t slot)
+{
+  //  validate the expression once (dummy eval) -> honest SKIP if malformed.
+  bool ok = true;
+  eval_prop_expr (r.prop_expr, 1.0, 1.0, 1.0, 1.0, ok);
+  if (! ok) {
+    SVRFResult res; res.rule = &r; res.verdict = "SKIP";
+    res.info = "unparsable property expr";
+    m_results[slot] = res;
+    return;
+  }
+  db::Region reg;
+  try {
+    reg = resolve (r.layer1);
+  } catch (tl::Exception &e) {
+    SVRFResult res; res.rule = &r; res.verdict = "ERROR";
+    std::string m = e.msg (); if (m.size () > 80) m = m.substr (0, 80);
+    res.info = m; m_results[slot] = res; return;
+  } catch (...) {
+    SVRFResult res; res.rule = &r; res.verdict = "ERROR";
+    res.info = "property resolve error"; m_results[slot] = res; return;
+  }
+
+  const bool dbg = getenv ("SVRFDRC_PROPVAL") != 0;
+  db::Region viol;
+  std::size_t idx = 0;
+  for (db::Region::const_iterator p = reg.begin_merged (); ! p.at_end (); ++p, ++idx) {
+    const db::Polygon &poly = *p;
+    //  Per-shape measured properties in um. AREA/PERIMETER are exact integer DBU
+    //  measures scaled by the DBU; a scale-free equation (e.g. PERIMETER*PERIMETER
+    //  / AREA) is therefore reproducible to the bit regardless of the DBU.
+    double area  = (double) poly.area () * m_dbu * m_dbu;   // um^2
+    double perim = (double) poly.perimeter () * m_dbu;      // um
+    db::Box bb = poly.box ();
+    double pw = (double) bb.width () * m_dbu;               // um
+    double ph = (double) bb.height () * m_dbu;              // um
+    bool eok = true;
+    double val = eval_prop_expr (r.prop_expr, area, perim, pw, ph, eok);
+    if (! eok) continue;
+    bool bad = false;
+    if      (r.cmp == "<")  bad = (val <  r.value);
+    else if (r.cmp == "<=") bad = (val <= r.value);
+    else if (r.cmp == ">")  bad = (val >  r.value);
+    else if (r.cmp == ">=") bad = (val >= r.value);
+    else if (r.cmp == "==") bad = (val == r.value);
+    if (dbg) {
+      fprintf (stderr, "PROPVAL %s #%zu val=%.6f cmp %s thr=%.6f -> %s\n",
+               r.name.c_str (), idx, val, r.cmp.c_str (), r.value, bad ? "FAIL" : "ok");
+    }
+    if (bad) viol.insert (poly);
+  }
+
+  //  waiver suppression also applies to eqDRC violations (geometry-anchored).
+  db::EdgePairs no_ep;
+  std::size_t waived = 0;
+  maybe_apply_waivers (r, no_ep, false, viol, waived);
+
+  m_regions[r.name] = viol;
+  std::size_t cnt = viol.count ();
+  SVRFResult res; res.rule = &r;
+  res.verdict = cnt == 0 ? "PASS" : "FAIL";
+  res.info = std::to_string (cnt);
+  m_results[slot] = res;
+}
+
+// ---------------------------------------------------------------------------
+//  automated waiver management (#10): geometry-anchored marker suppression
+// ---------------------------------------------------------------------------
+
+void SVRFEngine::load_waivers ()
+{
+  m_waivers_enabled = false;
+  m_waivers.clear ();
+  const char *path = getenv ("SVRFDRC_WAIVERS");
+  if (! path || ! *path) return;
+  std::ifstream f (path);
+  if (! f) return;
+  std::string line;
+  while (std::getline (f, line)) {
+    size_t h = line.find ('#');                    // strip trailing comment
+    if (h != std::string::npos) line = line.substr (0, h);
+    std::istringstream ss (line);
+    std::string rule; double x1, y1, x2, y2;
+    if (! (ss >> rule >> x1 >> y1 >> x2 >> y2)) continue;   // blank / malformed -> skip
+    WaiverBox wb;
+    wb.l = std::min (x1, x2); wb.r = std::max (x1, x2);
+    wb.b = std::min (y1, y2); wb.t = std::max (y1, y2);
+    m_waivers[rule].push_back (wb);
+  }
+  m_waivers_enabled = ! m_waivers.empty ();
+}
+
+void SVRFEngine::maybe_apply_waivers (const SVRFRule &r, db::EdgePairs &ep, bool have_ep,
+                                      db::Region &viol, std::size_t &waived)
+{
+  waived = 0;
+  if (! m_waivers_enabled) return;
+
+  //  boxes keyed to this rule name PLUS the wildcard "*".
+  std::vector<WaiverBox> boxes;
+  std::map<std::string, std::vector<WaiverBox> >::const_iterator it = m_waivers.find (r.name);
+  if (it != m_waivers.end ()) boxes.insert (boxes.end (), it->second.begin (), it->second.end ());
+  it = m_waivers.find ("*");
+  if (it != m_waivers.end ()) boxes.insert (boxes.end (), it->second.begin (), it->second.end ());
+  if (boxes.empty ()) return;
+
+  //  a marker is waived only when its bbox is FULLY CONTAINED in a waiver box
+  //  (partial overlap / wrong coordinate never suppresses a real violation).
+  auto contained = [&] (const db::Box &b) -> const SVRFEngine::WaiverBox * {
+    double l = b.left () * m_dbu, bo = b.bottom () * m_dbu;
+    double rr = b.right () * m_dbu, tp = b.top () * m_dbu;
+    for (size_t k = 0; k < boxes.size (); ++k) {
+      const WaiverBox &w = boxes[k];
+      if (w.l <= l && w.r >= rr && w.b <= bo && w.t >= tp) return &boxes[k];
+    }
+    return 0;
+  };
+
+  std::vector<std::string> local_log;
+  auto logline = [&] (const db::Box &b, const SVRFEngine::WaiverBox *w) {
+    char buf[256];
+    snprintf (buf, sizeof (buf),
+              "WAIVED rule=%s marker_bbox_um=[%.4f,%.4f,%.4f,%.4f] waiver_box_um=[%.4f,%.4f,%.4f,%.4f]",
+              r.name.c_str (), b.left () * m_dbu, b.bottom () * m_dbu,
+              b.right () * m_dbu, b.top () * m_dbu, w->l, w->b, w->r, w->t);
+    local_log.push_back (buf);
+  };
+
+  if (have_ep) {
+    //  the driving count is ep.count(): filter edge pairs (and log here).
+    db::EdgePairs kept;
+    for (db::EdgePairs::const_iterator eit = ep.begin (); ! eit.at_end (); ++eit) {
+      db::Box b = (*eit).bbox ();
+      const SVRFEngine::WaiverBox *w = contained (b);
+      if (w) { ++waived; logline (b, w); }
+      else   { kept.insert (*eit); }
+    }
+    ep = kept;
+  }
+
+  //  filter the marker Region so the error layer excludes waived shapes. When
+  //  have_ep the count already came from ep -> do NOT re-count / re-log here.
+  db::Region keptr;
+  for (db::Region::const_iterator vit = viol.begin (); ! vit.at_end (); ++vit) {
+    db::Box b = (*vit).box ();
+    const SVRFEngine::WaiverBox *w = contained (b);
+    if (w) {
+      if (! have_ep) { ++waived; logline (b, w); }
+    } else {
+      keptr.insert (*vit);
+    }
+  }
+  viol = keptr;
+
+  if (! local_log.empty ()) {
+    tl::MutexLocker lock (&m_waiver_mx);
+    for (size_t k = 0; k < local_log.size (); ++k) m_waiver_log.push_back (local_log[k]);
+  }
+}
+
+void SVRFEngine::flush_waiver_audit () const
+{
+  if (m_waiver_log.empty ()) return;
+  //  stderr trail (always) + optional file named by $SVRFDRC_WAIVER_AUDIT.
+  for (size_t k = 0; k < m_waiver_log.size (); ++k) {
+    fprintf (stderr, "%s\n", m_waiver_log[k].c_str ());
+  }
+  const char *ap = getenv ("SVRFDRC_WAIVER_AUDIT");
+  if (ap && *ap) {
+    std::ofstream af (ap);
+    if (af) {
+      for (size_t k = 0; k < m_waiver_log.size (); ++k) af << m_waiver_log[k] << "\n";
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  DFM scoring (#47): weighted soft-rule aggregate (advisory, post-processing)
+// ---------------------------------------------------------------------------
+
+void SVRFEngine::compute_dfm_score () const
+{
+  const char *wf = getenv ("SVRFDRC_DFM_WEIGHTS");
+  if (! wf || ! *wf) return;
+  std::ifstream f (wf);
+  if (! f) return;
+  std::map<std::string, double> weights;
+  std::string line;
+  while (std::getline (f, line)) {
+    size_t h = line.find ('#');
+    if (h != std::string::npos) line = line.substr (0, h);
+    std::istringstream ss (line);
+    std::string rn; double wt;
+    if (ss >> rn >> wt) weights[rn] = wt;
+  }
+  if (weights.empty ()) return;
+
+  //  Aggregate weight_i * viol_i over the SOFT rules, reading each rule's REAL
+  //  violation count straight out of its frozen report slot (info == the count
+  //  for PASS/FAIL; SKIP/ERROR contribute 0). No verdict is altered.
+  double score = 0.0;
+  int nsoft = 0;
+  long total_viol = 0;
+  std::vector<std::string> detail;
+  for (std::vector<SVRFResult>::const_iterator it = m_results.begin (); it != m_results.end (); ++it) {
+    if (! it->rule) continue;
+    std::map<std::string, double>::const_iterator w = weights.find (it->rule->name);
+    if (w == weights.end ()) continue;
+    long cnt = 0;
+    if (it->verdict == "FAIL" || it->verdict == "PASS") {
+      cnt = strtol (it->info.c_str (), 0, 10);
+    }
+    double contrib = w->second * (double) cnt;
+    score += contrib;
+    total_viol += cnt;
+    ++nsoft;
+    char buf[256];
+    snprintf (buf, sizeof (buf), "DFM soft rule=%s weight=%.4f viol=%ld contrib=%.4f",
+              it->rule->name.c_str (), w->second, cnt, contrib);
+    detail.push_back (buf);
+  }
+
+  char hdr[128];
+  snprintf (hdr, sizeof (hdr), "DFM score=%.4f soft_rules=%d total_viol=%ld", score, nsoft, total_viol);
+  fprintf (stderr, "%s\n", hdr);
+  for (size_t k = 0; k < detail.size (); ++k) fprintf (stderr, "%s\n", detail[k].c_str ());
+
+  const char *op = getenv ("SVRFDRC_DFM_OUT");
+  if (op && *op) {
+    std::ofstream o (op);
+    if (o) {
+      o << hdr << "\n";
+      for (size_t k = 0; k < detail.size (); ++k) o << detail[k] << "\n";
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3276,6 +3646,14 @@ void SVRFEngine::write_report (const std::string &report_path, const std::string
     if (vpad.size () < 5) vpad.append (5 - vpad.size (), ' ');
     std::string npad = r.name;
     if (npad.size () < 18) npad.append (18 - npad.size (), ' ');
+
+    //  eqDRC (#8): PROPERTY renders its measured expression inline so the report
+    //  stays auditable (only PROPERTY rules take this branch -> no other op moves).
+    if (r.op == "PROPERTY") {
+      out << vpad << " " << npad << " PROPERTY " << r.layer1 << " { " << r.prop_expr << " } "
+          << r.cmp << " " << py_float_str (r.value) << " " << tag << " -> " << it->info << "\n";
+      continue;
+    }
 
     out << vpad << " " << npad << " " << r.op << " " << r.layer1;
     if (! r.layer2.empty ()) {

@@ -1,0 +1,15 @@
+// property.rule -- SYNTHETIC eqDRC (equation-based DRC, fork feature #8) gate.
+//
+// COMPACT is an equation-based rule: it flags any polygon whose isoperimetric
+// ratio  (PERIMETER * PERIMETER) / AREA  exceeds 40. Both PERIMETER and AREA are
+// exact integer-DBU measures and the ratio is scale-free, so the computed value
+// is reproducible to the bit regardless of the layout DBU:
+//   square 5x5 um : perimeter 20 um, area 25 um^2 -> 400/25  = 16.0   (PASS, 16   < 40)
+//   sliver 1x20 um: perimeter 42 um, area 20 um^2 -> 1764/20 = 88.2   (FAIL, 88.2 > 40)
+//
+// NO vendor data.
+LAYER poly 10 0
+
+COMPACT {
+  PROPERTY poly ( PERIMETER * PERIMETER ) / AREA > 40.0
+}

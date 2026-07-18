@@ -52,6 +52,9 @@ g++ -std=c++17 -O1 -DHAVE_PYTHON \
 #    empty      -- boolean/select ops with an EMPTY operand (the pflag key-vs-value bug)
 #    antenna    -- native in-engine ANTENNA op (#20): 2-layer staged charge-ratio FAIL +
 #                  PASS + one-layer honest-SKIP. Deep gate: run_antenna_engine_test.sh.
+#    property   -- eqDRC PROPERTY op (#8): (PERIMETER*PERIMETER)/AREA sliver detector;
+#                  square 16.0 PASS-shape + sliver 88.2 FAIL-shape -> FAIL 1. Deep gate
+#                  (hand-computed per-shape value): run_property_engine_test.sh.
 CORPORA=(
   "coverage  synth  gen_synth_gds.py"
   "coverage2 synth2 gen_synth2_gds.py"
@@ -59,6 +62,7 @@ CORPORA=(
   "empty     empty  gen_empty_gds.py"
   "corner    corner gen_corner_gds.py"
   "antenna   antenna gen_antenna_gds.py"
+  "property  property gen_property_gds.py"
 )
 for row in "${CORPORA[@]}"; do
   set -- $row

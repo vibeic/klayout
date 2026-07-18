@@ -1,0 +1,24 @@
+// dfm.rule -- SYNTHETIC DFM-scoring / recommended-(soft)-rule (#47) gate.
+//
+// Three rules over one poly layer. Two are declared SOFT by the weights file
+// ($SVRFDRC_DFM_WEIGHTS); the third (HARD_SP) is NOT weighted and must contribute
+// 0 to the DFM score:
+//   SR_SLIVER  : PROPERTY flags each 1x20 um sliver  (ratio 88.2 > 40)   -> 3
+//   SR_MINAREA : AREA flags each 0.5x0.5 um square   (0.25 um^2 < 0.3)   -> 2
+//   HARD_SP    : a plain spacing rule, unweighted (excluded from the score)
+//
+// With weights SR_SLIVER=2.0, SR_MINAREA=0.5 the DFM score is the hand-computed
+//   2.0*3 + 0.5*2 = 7.0   (soft_rules=2, total_viol=5). NO vendor data.
+LAYER poly 10 0
+
+SR_SLIVER {
+  PROPERTY poly ( PERIMETER * PERIMETER ) / AREA > 40.0
+}
+
+SR_MINAREA {
+  AREA poly < 0.3
+}
+
+HARD_SP {
+  EXTERNAL poly < 0.1
+}

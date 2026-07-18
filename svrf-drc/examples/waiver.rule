@@ -1,0 +1,16 @@
+// waiver.rule -- SYNTHETIC automated-waiver-management (fork feature #10) gate.
+//
+// MINAREA flags every polygon whose area is below 0.5 um^2. Two undersized
+// squares sit at known coordinates so a geometry-anchored waiver can be aimed at
+// exactly one of them:
+//   A: 0.5x0.5 um at (0,0)     -> area 0.25 um^2, marker bbox [0,0,0.5,0.5]
+//   B: 0.6x0.6 um at (10,10)   -> area 0.36 um^2, marker bbox [10,10,10.6,10.6]
+//
+// With NO $SVRFDRC_WAIVERS both flag (FAIL 2). A waiver box that FULLY CONTAINS
+// A's marker suppresses only A (FAIL 1); a wrong / partial / rule-mismatched
+// waiver box suppresses nothing (FAIL 2). NO vendor data.
+LAYER m1 20 0
+
+MINAREA {
+  AREA m1 < 0.5
+}

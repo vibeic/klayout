@@ -351,6 +351,44 @@ static const std::regex &meas_re ()
   return re;
 }
 
+//  eqDRC (#8) recognizer. Groups: 1=layer 2=property-expr 3=cmp 4=value.
+//    PROPERTY <layer> <expr over AREA/PERIMETER/WIDTH/HEIGHT + - * / ( )> <cmp> <value>
+//  The expression carries NO relational operator, so the trailing (cmp value)
+//  is unambiguous and the non-greedy expr capture stops at the sole relational
+//  token. Anchored to end-of-string like meas_re -- the PROPERTY statement is the
+//  last line of its rule body (same convention as every measurement rule).
+static const std::regex &prop_re ()
+{
+  static const std::regex re (
+    R"(\bPROPERTY\b\s+([A-Za-z_][\w.$]*)\s+(.+?)\s*(<=|<|==|>=|>)\s*([0-9]*\.?[0-9]+)\s*$)",
+    std::regex::ECMAScript | std::regex::icase);
+  return re;
+}
+
+static SVRFRule make_property_rule (const std::string &name, const std::smatch &m)
+{
+  SVRFRule r;
+  r.name = name;
+  r.op = "PROPERTY";
+  r.layer1 = m[1].str ();
+  {
+    std::string e = m[2].str ();
+    size_t a = e.find_first_not_of (" \t\r\n\f\v");
+    size_t b = e.find_last_not_of (" \t\r\n\f\v");
+    r.prop_expr = (a == std::string::npos) ? std::string () : e.substr (a, b - a + 1);
+  }
+  r.cmp = m[3].str ();
+  r.value = std::stod (m[4].str ());
+  {
+    std::string full = m[0].str ();
+    size_t a = full.find_first_not_of (" \t\r\n\f\v");
+    size_t b = full.find_last_not_of (" \t\r\n\f\v");
+    r.raw = (a == std::string::npos) ? std::string () : full.substr (a, b - a + 1);
+  }
+  r.supported = true;
+  return r;
+}
+
 static void parse_modifiers (SVRFRule &rule, const std::string &tail)
 {
   static const std::regex re_proj (
@@ -1012,8 +1050,15 @@ SVRFDeck parse_deck (const std::string &text)
         deck.rules.push_back (r);
         deck.statements.push_back ({SVRFStatement::Rule, idx});
       } else {
+        std::smatch pm;
         std::smatch cp;
-        if (std::regex_search (joined, cp, copy_re)) {
+        if (std::regex_search (joined, pm, prop_re ())) {
+          //  eqDRC (#8): PROPERTY <layer> <expr> <cmp> <value>
+          SVRFRule r = make_property_rule (name, pm);
+          size_t idx = deck.rules.size ();
+          deck.rules.push_back (r);
+          deck.statements.push_back ({SVRFStatement::Rule, idx});
+        } else if (std::regex_search (joined, cp, copy_re)) {
           SVRFRule r;
           r.name = name;
           r.op = "COPY";
@@ -1047,8 +1092,15 @@ SVRFDeck parse_deck (const std::string &text)
         rhs_stripped = (a == std::string::npos) ? std::string () : rhs.substr (a, b - a + 1);
       }
       std::smatch mm;
+      std::smatch pm;
       if (std::regex_search (rhs_stripped, mm, meas_re (), std::regex_constants::match_continuous)) {
         SVRFRule r = make_rule (ah[1].str (), mm);
+        size_t idx = deck.rules.size ();
+        deck.rules.push_back (r);
+        deck.statements.push_back ({SVRFStatement::Rule, idx});
+      } else if (std::regex_search (rhs_stripped, pm, prop_re (), std::regex_constants::match_continuous)) {
+        //  eqDRC (#8) assignment form:  NAME = PROPERTY <layer> <expr> <cmp> <value>
+        SVRFRule r = make_property_rule (ah[1].str (), pm);
         size_t idx = deck.rules.size ();
         deck.rules.push_back (r);
         deck.statements.push_back ({SVRFStatement::Rule, idx});

@@ -183,6 +183,36 @@ private:
   //  top-level (a footprint-rectangle subtraction would wrongly erase it).
   db::Region m_feol_qual_feol;
 
+  //  -- automated waiver management (#10) ----------------------------------
+  //  Pre-approved, geometry-anchored waivers loaded ONCE at the head of
+  //  execute() (single-threaded) from the file named by $SVRFDRC_WAIVERS, then
+  //  only READ during the (possibly parallel) rule phase. A violation marker is
+  //  waived only when its bounding box is FULLY CONTAINED in a waiver box that
+  //  is keyed to this rule (or the wildcard "*") -- a partial overlap or wrong
+  //  coordinate never suppresses it. Default (env unset) => m_waivers_enabled
+  //  stays false and the whole path is a no-op => byte-identical to HEAD.
+  struct WaiverBox { double l, b, r, t; };               // um, normalized (l<=r, b<=t)
+  bool m_waivers_enabled = false;
+  std::map<std::string, std::vector<WaiverBox> > m_waivers;  // rule-name (or "*") -> boxes
+  std::vector<std::string> m_waiver_log;                 // audit trail, one line per waived marker
+  tl::Mutex m_waiver_mx;                                 // guards m_waiver_log under worker threads
+  void load_waivers ();                                  // parse $SVRFDRC_WAIVERS (once, in execute())
+  //  Subtract waived markers from a rule's violation set in place. When have_ep
+  //  the driving count is ep.count(): filter ep AND the marker Region viol so both
+  //  stay consistent; else filter viol only. `waived` receives the suppressed count.
+  void maybe_apply_waivers (const SVRFRule &r, db::EdgePairs &ep, bool have_ep,
+                            db::Region &viol, std::size_t &waived);
+  void flush_waiver_audit () const;                      // emit audit to stderr + $SVRFDRC_WAIVER_AUDIT
+
+  //  -- DFM scoring / recommended (soft) rules (#47) -----------------------
+  //  Advisory aggregate: when $SVRFDRC_DFM_WEIGHTS names a <rule-name> <weight>
+  //  file, rules listed there are treated as SOFT -- their per-rule PASS/FAIL
+  //  line is unchanged, but their real violation counts are combined into a
+  //  weighted DFM score  sum(weight_i * viol_i)  emitted to stderr and, if set,
+  //  to $SVRFDRC_DFM_OUT. Pure post-processing over m_results (single-threaded,
+  //  runs after the rule phase); env unset => nothing emitted => byte-identical.
+  void compute_dfm_score () const;
+
   //  built lazily from the CONNECT stack for connectivity / net-area-ratio rules
   std::unique_ptr<db::LayoutToNetlist> m_l2n;
   std::map<std::string, db::Region> m_l2n_layers;   // name -> registered Region copy
@@ -220,6 +250,15 @@ private:
   void exec_rule (const SVRFRule &r, std::size_t slot);
   void exec_edge_rule (const SVRFRule &r, std::size_t slot);
   void exec_density (const SVRFRule &r, std::size_t slot);
+
+  //  eqDRC (#8): equation-based DRC. exec_property evaluates prop_expr per merged
+  //  shape over its measured properties and flags shapes that satisfy the error
+  //  relation. eval_prop_expr is a small recursive-descent evaluator over
+  //  AREA / PERIMETER / WIDTH / HEIGHT + - * / ( ) and literals; ok=false on a
+  //  malformed expression (rule then honest-SKIPs). No layout state -> reentrant.
+  void exec_property (const SVRFRule &r, std::size_t slot);
+  static double eval_prop_expr (const std::string &expr, double area, double perim,
+                                double w, double h, bool &ok);
   db::RegionCheckOptions check_options (const SVRFRule &r, bool allow_filters = true) const;
   db::EdgesCheckOptions  edge_check_options (const SVRFRule &r) const;
   bool inputs_unmodeled (const SVRFRule &r) const;

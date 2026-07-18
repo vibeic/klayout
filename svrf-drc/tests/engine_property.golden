@@ -1,0 +1,7 @@
+# SVRF-native DRC via KLayout KLayout 0.30.9
+# deck=/work/property.rule  layout=/work/property.gds  dbu=0.001
+# 1 layers, 0 derivations, 1 rules  |  {'FAIL': 1}
+
+FAIL  COMPACT            PROPERTY poly { ( PERIMETER * PERIMETER ) / AREA } > 40.0 [metrics=euclidian] -> 1
+
+# tally: {'FAIL': 1}

@@ -64,6 +64,12 @@ struct SVRFRule
   double window = 0.0;                    // DENSITY WINDOW w (um)
   bool has_step = false;
   double step = 0.0;                      // DENSITY STEP s (um)
+  //  eqDRC (#8): equation-based DRC. When op == "PROPERTY", prop_expr holds the
+  //  per-shape numeric expression over the built-in measured properties
+  //  (AREA, PERIMETER, WIDTH, HEIGHT of the shape bounding box); the shape is a
+  //  violation when   eval(prop_expr) <cmp> value   is TRUE (Calibre convention:
+  //  the rule states the ERROR condition). Empty for every other op.
+  std::string prop_expr;
   bool supported = true;
   std::string reason;
   std::string raw;
