@@ -1,0 +1,19 @@
+// rve.rule -- SYNTHETIC gate for the RVE-style result database (#9).
+//
+// One min-area rule over one poly layer. The failing shapes ARE the error
+// markers, so their geometry lands verbatim in the emitted .lyrdb:
+//   SR_MINAREA : AREA flags each 0.5x0.5 um square (0.25 um^2 < 0.3) -> FAIL
+//   CLEAN_SP   : a plain spacing rule that PASSES (no markers -> not in the DB)
+//
+// The RVE DB ($SVRFDRC_RVE_OUT) must contain exactly one category (SR_MINAREA)
+// with one item per failing square, each polygon at the HAND-COMPUTED um bbox.
+// NO vendor data.
+LAYER poly 10 0
+
+SR_MINAREA {
+  AREA poly < 0.3
+}
+
+CLEAN_SP {
+  EXTERNAL poly < 0.1
+}

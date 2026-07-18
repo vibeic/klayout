@@ -473,6 +473,9 @@ const std::vector<SVRFResult> &SVRFEngine::execute ()
   //  DFM scoring (#47): advisory weighted aggregate over soft rules (no-op
   //  unless $SVRFDRC_DFM_WEIGHTS is set). Post-processing -> no rule verdicts move.
   compute_dfm_score ();
+  //  RVE result DB (#9): KLayout-loadable marker DB from the frozen error
+  //  regions (no-op unless $SVRFDRC_RVE_OUT is set). Post-processing only.
+  emit_rve_db ();
   return m_results;
 }
 
@@ -3305,6 +3308,132 @@ void SVRFEngine::compute_dfm_score () const
       for (size_t k = 0; k < detail.size (); ++k) o << detail[k] << "\n";
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+//  RVE-style result database (#9): KLayout-loadable .lyrdb marker DB.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+//  minimal XML text escape for the handful of category/cell strings we emit.
+static std::string xml_escape (const std::string &s)
+{
+  std::string o;
+  o.reserve (s.size ());
+  for (char c : s) {
+    switch (c) {
+      case '&':  o += "&amp;";  break;
+      case '<':  o += "&lt;";   break;
+      case '>':  o += "&gt;";   break;
+      case '"':  o += "&quot;"; break;
+      default:   o += c;        break;
+    }
+  }
+  return o;
+}
+
+//  print a um coordinate the way KLayout's rdb value strings expect: fixed
+//  decimals with trailing zeros (and a dangling '.') trimmed, so an integer
+//  micron reads back "3" and a DBU-exact value reads back "3.8" / "0.25".
+static std::string fmt_um (double v)
+{
+  char buf[64];
+  snprintf (buf, sizeof (buf), "%.6f", v);
+  std::string s (buf);
+  std::string::size_type dot = s.find ('.');
+  if (dot != std::string::npos) {
+    std::string::size_type last = s.find_last_not_of ('0');
+    if (last == dot) last = dot - 1;                 // strip the '.' too
+    s.erase (last + 1);
+  }
+  if (s == "-0") s = "0";
+  return s;
+}
+
+}  // namespace
+
+void SVRFEngine::emit_rve_db () const
+{
+  const char *path = getenv ("SVRFDRC_RVE_OUT");
+  if (! path || ! *path) return;
+  std::ofstream o (path);
+  if (! o) return;
+
+  const std::string top = m_layout.cell_name (m_top);
+
+  //  Collect FAILing rules in source order (dedup category names). Each rule's
+  //  error markers live in m_regions[rule->name] -- the SAME frozen error layer
+  //  the report counted, so the DB can never disagree with the verdict.
+  std::vector<std::string> cats;                       // unique category (rule) names
+  std::set<std::string> seen;
+  for (std::vector<SVRFResult>::const_iterator it = m_results.begin (); it != m_results.end (); ++it) {
+    if (! it->rule || it->verdict != "FAIL") continue;
+    if (seen.insert (it->rule->name).second) cats.push_back (it->rule->name);
+  }
+
+  o << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
+  o << "<report-database>\n";
+  o << " <description>svrfdrc native SVRF/DRC run</description>\n";
+  o << " <original-file/>\n";
+  o << " <generator>svrfdrc</generator>\n";
+  o << " <top-cell>" << xml_escape (top) << "</top-cell>\n";
+  o << " <tags>\n </tags>\n";
+
+  o << " <categories>\n";
+  for (size_t i = 0; i < cats.size (); ++i) {
+    o << "  <category>\n";
+    o << "   <name>" << xml_escape (cats[i]) << "</name>\n";
+    o << "   <description/>\n";
+    o << "   <categories>\n   </categories>\n";
+    o << "  </category>\n";
+  }
+  o << " </categories>\n";
+
+  o << " <cells>\n";
+  o << "  <cell>\n";
+  o << "   <name>" << xml_escape (top) << "</name>\n";
+  o << "   <variant/>\n   <layout-name/>\n";
+  o << "   <references>\n   </references>\n";
+  o << "  </cell>\n";
+  o << " </cells>\n";
+
+  //  one <item> per error marker polygon, category = the rule name.
+  long total_items = 0;
+  o << " <items>\n";
+  for (std::vector<SVRFResult>::const_iterator it = m_results.begin (); it != m_results.end (); ++it) {
+    if (! it->rule || it->verdict != "FAIL") continue;
+    std::map<std::string, db::Region>::const_iterator ri = m_regions.find (it->rule->name);
+    if (ri == m_regions.end ()) continue;
+    const std::string cat = xml_escape (it->rule->name);
+    for (db::Region::const_iterator p = ri->second.begin (); ! p.at_end (); ++p) {
+      db::Polygon poly = *p;
+      o << "  <item>\n";
+      o << "   <tags/>\n";
+      o << "   <category>" << cat << "</category>\n";
+      o << "   <cell>" << xml_escape (top) << "</cell>\n";
+      o << "   <visited>false</visited>\n";
+      o << "   <multiplicity>1</multiplicity>\n";
+      o << "   <comment/>\n   <image/>\n";
+      o << "   <values>\n";
+      o << "    <value>polygon: (";
+      bool first = true;
+      for (db::Polygon::polygon_contour_iterator h = poly.begin_hull (); h != poly.end_hull (); ++h) {
+        if (! first) o << ";";
+        first = false;
+        o << fmt_um ((*h).x () * m_dbu) << "," << fmt_um ((*h).y () * m_dbu);
+      }
+      o << ")</value>\n";
+      o << "   </values>\n";
+      o << "  </item>\n";
+      ++total_items;
+    }
+  }
+  o << " </items>\n";
+  o << "</report-database>\n";
+
+  fprintf (stderr, "SVRFDRC_RVE wrote %s categories=%zu items=%ld\n",
+           path, cats.size (), total_items);
 }
 
 // ---------------------------------------------------------------------------

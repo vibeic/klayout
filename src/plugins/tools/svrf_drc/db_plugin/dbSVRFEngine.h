@@ -213,6 +213,17 @@ private:
   //  runs after the rule phase); env unset => nothing emitted => byte-identical.
   void compute_dfm_score () const;
 
+  //  -- RVE-style result database (#9) -------------------------------------
+  //  When $SVRFDRC_RVE_OUT names a path, write a KLayout-loadable marker
+  //  database (.lyrdb / rdb XML) built from the SAME frozen per-rule error
+  //  regions the report counts: one <category> per FAILing rule, one <item>
+  //  polygon per error marker (coordinates in um = db-coord * m_dbu). This is
+  //  the cross-probe DB the GUI can load so a violation can be inspected in
+  //  place. Pure post-processing over m_results + m_regions (single-threaded,
+  //  runs after the rule phase); env unset => nothing written => byte-identical
+  //  to HEAD. No verdict is altered.
+  void emit_rve_db () const;
+
   //  built lazily from the CONNECT stack for connectivity / net-area-ratio rules
   std::unique_ptr<db::LayoutToNetlist> m_l2n;
   std::map<std::string, db::Region> m_l2n_layers;   // name -> registered Region copy
