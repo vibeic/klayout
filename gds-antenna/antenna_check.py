@@ -133,6 +133,7 @@ def run(gds, cfg, cell_name=None):
     pya = _load_pya()
     ly = pya.Layout()
     ly.read(gds)
+    dbu = ly.dbu
     dbu2 = ly.dbu * ly.dbu
     top = ly.cell(cell_name) if cell_name else ly.top_cell()
     if top is None:
@@ -146,6 +147,19 @@ def run(gds, cfg, cell_name=None):
     diode_credit = bool(cfg.get("diode_credit", False))
     gate_and = cfg.get("gate", {}).get("and")
     gl = cfg.get("gate_layers", {})
+
+    # Diode-aware relief (#45): a per-NET protection-diode recognition that is more
+    # precise than the blanket diffusion `diode_credit`. Each entry in
+    # "diode_layers" is an antenna-diode ANODE marker [layer,datatype]; a net whose
+    # extracted geometry is electrically connected to a diode marker is RELIEVED
+    # (its antenna violation is suppressed, and recorded under "relieved"). For an
+    # unprotected VIOLATING net the tool emits a candidate diode INSERTION SITE
+    # (the vulnerable gate's bbox + centre). Absent/empty "diode_layers" => this
+    # whole path is off and the output is byte-identical to the pre-#45 tool.
+    diode_specs = cfg.get("diode_layers") or []
+    diode_on = len(diode_specs) > 0
+    relieved_total = 0
+    suggest_total = 0
 
     # CAA (cumulative antenna area, #44): the numerator accumulates every interconnect
     # conductor (roles below) up each stage; enabled only when a cumulative limit is
@@ -193,6 +207,20 @@ def run(gds, cfg, cell_name=None):
                     l2n.connect(regs[c["name"]], regs[stage[i - 1]["name"]])
                 if i + 1 < len(stage):
                     l2n.connect(regs[c["name"]], regs[stage[i + 1]["name"]])
+        # diode-aware relief (#45): register each antenna-diode ANODE marker and
+        # tie it to every metal in the stage (a protection diode taps the metal
+        # net down to substrate), so a net carrying a diode marker shows nonzero
+        # diode area on its extracted net.
+        diode_regs = []
+        if diode_on:
+            for di, dspec in enumerate(diode_specs):
+                dreg = l2n.make_polygon_layer(_li(ly, dspec), f"_diode{di}")
+                for c in stage:
+                    if c.get("role") == "metal":
+                        l2n.connect(dreg, regs[c["name"]])
+                l2n.connect(dreg)
+                diode_regs.append(dreg)
+
         # diode credit: connect diffusion/active so a net reaching it is relieved
         if diode_credit and gate_and:
             act = l2n.make_polygon_layer(_li(ly, gl[gate_and[1]]), "_act")
@@ -216,6 +244,8 @@ def run(gds, cfg, cell_name=None):
         cum_layers = [c["name"] for c in stage if c.get("role") in cum_roles]
         worst = 0.0
         detail = []
+        relieved = []       # #45: violating nets suppressed by a recognized diode
+        suggestions = []    # #45: candidate diode insertion sites (unprotected viols)
         caa_worst = 0.0
         caa_detail = []
         for ckt in nl.each_circuit():
@@ -239,9 +269,37 @@ def run(gds, cfg, cell_name=None):
                 ratio = ma / ga
                 worst = max(worst, ratio)
                 if ratio > limit:
-                    detail.append({"metal_um2": round(ma, 4),
-                                   "gate_um2": round(ga, 4),
-                                   "ratio": round(ratio, 4)})
+                    # #45: is this net protected by a recognized antenna diode?
+                    protected = False
+                    if diode_on:
+                        protected = any(
+                            _net_area(l2n, net, dr, dbu2, pya) > 0.0
+                            for dr in diode_regs)
+                    if diode_on and protected:
+                        # the diode relieves the antenna: suppress the violation.
+                        relieved.append({"metal_um2": round(ma, 4),
+                                         "gate_um2": round(ga, 4),
+                                         "ratio": round(ratio, 4)})
+                    else:
+                        detail.append({"metal_um2": round(ma, 4),
+                                       "gate_um2": round(ga, 4),
+                                       "ratio": round(ratio, 4)})
+                        if diode_on:
+                            # unprotected violating net -> suggest where to drop a
+                            # protection diode: at the vulnerable gate (its bbox +
+                            # centre, in um), the natural tap-down site.
+                            greg = pya.Region()
+                            greg.insert(l2n.shapes_of_net(net, gate, True))
+                            greg.merge()
+                            gb = greg.bbox()
+                            suggestions.append({
+                                "gate_bbox_um": [round(gb.left * dbu, 4),
+                                                 round(gb.bottom * dbu, 4),
+                                                 round(gb.right * dbu, 4),
+                                                 round(gb.top * dbu, 4)],
+                                "diode_xy_um": [round((gb.left + gb.right) / 2.0 * dbu, 4),
+                                                round((gb.bottom + gb.top) / 2.0 * dbu, 4)],
+                                "ratio": round(ratio, 4)})
                 # CAA: accumulate ALL interconnect conductor on this net up to the
                 # current stage (the charge-sharing node) and test the cumulative
                 # bound. This is what catches a net that clears every per-layer metal
@@ -262,6 +320,14 @@ def run(gds, cfg, cell_name=None):
               "worst_ratio": round(worst, 4),
               "violations": len(detail),
               "detail": detail[:20]}
+        if diode_on:
+            relieved.sort(key=lambda d: -d["ratio"])
+            suggestions.sort(key=lambda d: -d["ratio"])
+            pl["diode_relieved"] = len(relieved)
+            pl["relieved"] = relieved[:20]
+            pl["suggestions"] = suggestions[:20]
+            relieved_total += len(relieved)
+            suggest_total += len(suggestions)
         if caa_on:
             caa_enabled = True
             caa_detail.sort(key=lambda d: -d["ratio"])
@@ -291,6 +357,10 @@ def run(gds, cfg, cell_name=None):
         res["caa"] = {"enabled": True,
                       "worst_cumulative_ratio": round(caa_worst_overall, 4),
                       "cumulative_violations": caa_total_viol}
+    if diode_on:
+        res["diode_recognition"] = {"enabled": True,
+                                    "relieved_nets": relieved_total,
+                                    "insertion_sites": suggest_total}
     if not any_gate:
         res["verdict"] = "HONEST_SKIP"
         res["note"] = ("no net carried gate area — check the gate/layer config "

@@ -22,7 +22,7 @@ import os
 import sys
 
 
-def build(path, met1_len_um, met2_len_um=0.0, dbu=0.001):
+def build(path, met1_len_um, met2_len_um=0.0, dbu=0.001, diode=False, diode_offnet=False):
     import pya
     ly = pya.Layout()
     ly.dbu = dbu
@@ -35,6 +35,7 @@ def build(path, met1_len_um, met2_len_um=0.0, dbu=0.001):
     met1 = ly.layer(4, 0)
     via1 = ly.layer(5, 0)
     met2 = ly.layer(6, 0)
+    diode_l = ly.layer(7, 0)   # antenna-diode ANODE marker (#45 recognition layer)
 
     # active 2x2um; poly 0.5um-wide strip crossing it -> gate = 0.5um * 2um = 1.0 um^2
     top.shapes(active).insert(pya.Box(0, 0, 2 * U, 2 * U))
@@ -58,6 +59,15 @@ def build(path, met1_len_um, met2_len_um=0.0, dbu=0.001):
                                         vx + int(0.3 * U), y0 + int(0.4 * U)))
         top.shapes(met2).insert(pya.Box(vx, y0,
                                         vx + int(met2_len_um * U), y0 + int(0.5 * U)))
+    # #45: an antenna-diode ANODE marker overlapping the met1 antenna wire, so it
+    # is electrically ON the antenna net. A 0.5x0.5um square at (2.0,3.0)-(2.5,3.5)
+    # sits inside the met1 wire (y in [3.0,3.5]) whenever the wire reaches x=2.5.
+    if diode:
+        top.shapes(diode_l).insert(pya.Box(2 * U, y0, int(2.5 * U), y0 + int(0.5 * U)))
+    # a diode marker placed OFF the net (touching no conductor): proves recognition
+    # is CONNECTIVITY-based -- a stray diode elsewhere must NOT relieve the antenna.
+    if diode_offnet:
+        top.shapes(diode_l).insert(pya.Box(50 * U, 50 * U, int(50.5 * U), int(50.5 * U)))
     ly.write(path)
 
 
@@ -65,12 +75,14 @@ def main():
     out = os.environ.get("ANT_OUT")
     length = float(os.environ.get("ANT_LEN", "100"))
     met2 = float(os.environ.get("ANT_MET2_LEN", "0"))
+    diode = os.environ.get("ANT_DIODE", "0") not in ("0", "", "false", "False")
+    diode_offnet = os.environ.get("ANT_DIODE_OFFNET", "0") not in ("0", "", "false", "False")
     if not out:
         sys.stderr.write("gen_fixtures: set ANT_OUT and ANT_LEN.\n")
         return 2
-    build(out, length, met2)
+    build(out, length, met2, diode=diode, diode_offnet=diode_offnet)
     sys.stderr.write(f"gen_fixtures: wrote {out} (met1_len={length}um, "
-                     f"met2_len={met2}um)\n")
+                     f"met2_len={met2}um, diode={diode}, diode_offnet={diode_offnet})\n")
     return 0
 
 
