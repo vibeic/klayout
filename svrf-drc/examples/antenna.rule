@@ -1,0 +1,39 @@
+// antenna.rule -- SYNTHETIC (NO vendor data). Exercises the native in-engine
+// ANTENNA op (fork feature #20): the charge-ratio SVRF operator evaluated
+// directly on db::LayoutToNetlist, not routed to a separate tool.
+//
+// Layer numbers match gds-antenna/gen_fixtures.py (synthetic placeholders):
+//   active 1/0  poly 2/0  cont 3/0  met1 4/0  via1 5/0  met2 6/0
+//
+// gate = poly AND active  (the antenna denominator; rides the poly net)
+// Stack connectivity (bottom -> top): poly -(cont)- met1 -(via1)- met2
+//
+// ANTENNA <metal> <gate> <cmp> <ratio> :
+//   per-net ratio = area(metal on net) / area(gate on net), STAGED so an upper
+//   metal deposited after this etch cannot relieve the antenna. A net over the
+//   ratio limit is a violation. The one-layer form (no gate) still honest-SKIPs.
+
+LAYER active 1 0
+LAYER poly   2 0
+LAYER cont   3 0
+LAYER met1   4 0
+LAYER via1   5 0
+LAYER met2   6 0
+
+gate = poly AND active
+
+CONNECT poly met1 BY cont
+CONNECT met1 met2 BY via1
+
+// met1 antenna: at the met1 etch stage only poly/cont/met1 exist.
+ANT.M1 {
+  ANTENNA met1 gate > 40
+}
+// met2 antenna: at the met2 etch stage the whole poly..met2 node exists.
+ANT.M2 {
+  ANTENNA met2 gate > 40
+}
+// one-layer ANTENNA (no gate denominator) -> honest SKIP, routed out as before.
+ANT.M1.SIDE {
+  ANTENNA met1 > 400
+}

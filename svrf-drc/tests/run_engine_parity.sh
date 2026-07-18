@@ -50,12 +50,15 @@ g++ -std=c++17 -O1 -DHAVE_PYTHON \
 #    coverage2  -- separation/enclosure/notch/width/bool-COPY forced non-zero
 #    opdiff     -- select(INTERACT/CUT/NOT-INTERACT) + prefix OR/NOT/XOR + NET AREA RATIO
 #    empty      -- boolean/select ops with an EMPTY operand (the pflag key-vs-value bug)
+#    antenna    -- native in-engine ANTENNA op (#20): 2-layer staged charge-ratio FAIL +
+#                  PASS + one-layer honest-SKIP. Deep gate: run_antenna_engine_test.sh.
 CORPORA=(
   "coverage  synth  gen_synth_gds.py"
   "coverage2 synth2 gen_synth2_gds.py"
   "opdiff    opdiff gen_opdiff_gds.py"
   "empty     empty  gen_empty_gds.py"
   "corner    corner gen_corner_gds.py"
+  "antenna   antenna gen_antenna_gds.py"
 )
 for row in "${CORPORA[@]}"; do
   set -- $row

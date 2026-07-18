@@ -1,0 +1,9 @@
+# SVRF-native DRC via KLayout KLayout 0.30.9
+# deck=/work/antenna.rule  layout=/work/antenna.gds  dbu=0.001
+# 6 layers, 1 derivations, 3 rules  |  {'FAIL': 1, 'PASS': 1, 'SKIP': 1}
+
+FAIL  ANT.M1             ANTENNA met1/gate > 40.0 [metrics=euclidian] -> 1
+PASS  ANT.M2             ANTENNA met2/gate > 40.0 [metrics=euclidian] -> 0
+SKIP  ANT.M1.SIDE        ANTENNA met1 > 400.0 [metrics=euclidian] -> ANTENNA (charge ratio) routed to antenna checker, not geometric core
+
+# tally: {'FAIL': 1, 'PASS': 1, 'SKIP': 1}

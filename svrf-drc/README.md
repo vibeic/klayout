@@ -58,11 +58,18 @@ Every SVRF measurement modifier maps **1:1 onto a native KLayout check parameter
 |---|---|
 | `DENSITY a [b] <rel> d WINDOW w STEP s` | sliding-window `area / window-area` (`Region.area()`) |
 | `a NET AREA RATIO b <rel> v` | `LayoutToNetlist` per-net `shapes_of_net(net,·).area()` ratio |
+| `ANTENNA <metal> <gate> <rel> r` | **native** staged per-net antenna ratio on `LayoutToNetlist` (#20) |
 
-`ANTENNA` (charge-accumulation ratio) is routed to the antenna checker
-(OpenROAD / magic fork), not the geometric DRC core — an honest cross-tool route,
-not a silent guess. Every geometric / connectivity / density / net-ratio rule in
-the Calibre format executes natively here.
+`ANTENNA` (charge-accumulation ratio) now runs NATIVELY in the geometric core: the
+two-layer form `ANTENNA <metal> <gate> <cmp> <ratio>` names the gate denominator, so the
+engine computes the STAGED per-net ratio `area(metal on net) / area(gate on net)` directly
+on `LayoutToNetlist` — at the etch stage of `metal` only conductors at or below it (by
+CONNECT-graph rank from the gate base) form the node, so an upper-metal jumper cannot
+relieve a lower-stage antenna. This matches the standalone `gds-antenna` staged model (the
+honest cross-check). The one-layer form `ANTENNA <metal> <cmp> <r>` (no gate denominator)
+still honest-SKIPs — it carries no geometry to evaluate, so it is routed out rather than
+guessed. Every geometric / connectivity / density / net-ratio / antenna rule in the Calibre
+format now executes natively here.
 
 ## Layout
 
@@ -74,7 +81,7 @@ src/buddies/src/bd/svrfdrc.cc         # the svrfdrc(argc,argv) buddy entry (BD_T
 src/buddies/src/svrfdrc/svrfdrc.pro   # per-buddy .pro (linked into the `svrfdrc` CLI)
 
 svrf-drc/
-  examples/*.rule       # synthetic decks (NO vendor data): demo, conn, coverage(2), opdiff, empty
+  examples/*.rule       # synthetic decks (NO vendor data): demo, conn, coverage(2), opdiff, empty, antenna
   gen/                  # pya test-structure generators (no interpreter)
   tests/
     *.golden            # FROZEN oracle (parser dumps + engine reports; regression source of truth)
@@ -89,7 +96,8 @@ svrf-drc/
 
 Every statement of a real production Calibre DRC deck (a commercial 180 nm foundry
 deck, ~87 k lines) dispatches to a native KLayout check — **0 SKIP for any modeled
-rule** (`ANTENNA` is the sole honest cross-tool route). The native engine reproduces
+rule** (the two-layer `ANTENNA` charge-ratio now runs natively in-engine too; only the
+gate-less one-layer `ANTENNA` side-tally stays an honest routed-out SKIP). The native engine reproduces
 the retired Python reference **byte-for-byte** on that deck (identical tally + every
 rule line), which is the load-bearing correctness gate for the cutover.
 

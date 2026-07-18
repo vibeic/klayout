@@ -465,8 +465,20 @@ static SVRFRule make_rule (const std::string &name, const std::smatch &meas)
       r.step = r.window;
     }
   } else if (op == "ANTENNA") {
-    r.supported = false;
-    r.reason = "ANTENNA (charge ratio) routed to antenna checker, not geometric core";
+    //  Native in-engine antenna (fork feature #20). The two-layer form
+    //    ANTENNA <metal> <gate> <cmp> <ratio>
+    //  names the gate denominator explicitly, so the engine can compute the
+    //  staged per-net antenna ratio = area(metal on net) / area(gate on net)
+    //  directly on db::LayoutToNetlist (charge-ratio IN the geometric core).
+    //  The one-layer form (no gate) cannot be evaluated geometrically -> keep
+    //  the honest SKIP so decks that only tally a metal side-ratio still route
+    //  out (and the frozen single-layer goldens stay byte-identical).
+    if (r.layer2.empty ()) {
+      r.supported = false;
+      r.reason = "ANTENNA (charge ratio) routed to antenna checker, not geometric core";
+    } else {
+      r.supported = true;   // ANTENNA <metal> <gate> <cmp> <ratio> -> native staged check
+    }
   }
   return r;
 }

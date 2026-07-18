@@ -369,6 +369,7 @@ const std::vector<SVRFResult> &SVRFEngine::execute ()
                          consumed_later ||
                          dup_name ||
                          (r.op == "DENSITY") ||
+                         (r.op == "ANTENNA") ||     // native antenna builds a private L2N
                          (r.connectivity != SVRFConnectivity::none);
       if (main_thread) {
         exec_rule (r, slot);                         // inline, at source position
@@ -944,6 +945,7 @@ void SVRFEngine::execute_leveled (std::size_t n_noncopy,
       bool main_thread = consumed_later ||       // m_threads>1 here (>1 gate in caller)
                          dup_name ||
                          (r.op == "DENSITY") ||
+                         (r.op == "ANTENNA") ||     // native antenna builds a private L2N
                          (r.connectivity != SVRFConnectivity::none);
       if (main_thread) {
         exec_rule (r, slot);
@@ -2794,6 +2796,10 @@ void SVRFEngine::exec_rule (const SVRFRule &r, std::size_t slot)
     exec_density (r, slot);
     return;
   }
+  if (r.op == "ANTENNA") {
+    antenna_check (r, slot);           // native in-engine staged antenna (fork #20)
+    return;
+  }
 
   db::Coord d = to_dbu (r.value);
   db::EdgePairs ep;
@@ -3043,6 +3049,178 @@ db::Region SVRFEngine::net_area_ratio (const SVRFDerivation &d)
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+//  native in-engine ANTENNA (fork feature #20)
+// ---------------------------------------------------------------------------
+//
+//  ANTENNA <metal> <gate> <cmp> <ratio> -- the charge-ratio SVRF op, evaluated
+//  directly on db::LayoutToNetlist instead of being routed to a separate tool.
+//  STAGED connectivity: at the etch stage of `metal` only the conductors AT OR
+//  BELOW it participate (rank in the CONNECT graph, measured from the gate base),
+//  so an upper-metal jumper deposited AFTER this etch cannot relieve the antenna.
+//  Per net: ratio = area(metal on net) / area(gate on net); a net with no gate or
+//  no metal at this stage is not an antenna node and is skipped. The report count
+//  is the number of over-limit nets (PASS iff 0), matching every other rule.
+void SVRFEngine::antenna_check (const SVRFRule &r, std::size_t slot)
+{
+  auto skip = [&] (const std::string &why) {
+    SVRFResult res; res.rule = &r; res.verdict = "SKIP"; res.info = why;
+    m_results[slot] = res;
+  };
+  if (m_deck.connects.empty ()) {
+    skip ("ANTENNA needs a CONNECT stack for staged connectivity");
+    return;
+  }
+  const std::string metal = r.layer1;
+  const std::string gate  = r.layer2;
+
+  //  --- CONNECT graph (undirected): node set + adjacency --------------------
+  std::set<std::string> nodes;
+  std::map<std::string, std::set<std::string> > adj;
+  auto add_edge = [&] (const std::string &a, const std::string &b) {
+    if (a.empty () || b.empty ()) return;
+    nodes.insert (a); nodes.insert (b);
+    adj[a].insert (b); adj[b].insert (a);
+  };
+  for (std::vector<std::tuple<std::string, std::string, std::string> >::const_iterator c = m_deck.connects.begin (); c != m_deck.connects.end (); ++c) {
+    const std::string &a = std::get<0> (*c), &b = std::get<1> (*c), &v = std::get<2> (*c);
+    if (! v.empty ()) { add_edge (a, v); add_edge (b, v); }
+    else { add_edge (a, b); }
+  }
+  if (! nodes.count (metal)) {
+    skip ("ANTENNA metal layer not in the CONNECT stack");
+    return;
+  }
+
+  //  --- gate base: the CONNECT node the gate denominator rides --------------
+  //  gate = poly AND active is a bool/bool_expr derivation; its operand that is a
+  //  CONNECT-stack conductor (the poly) is the base. A gate that is itself a
+  //  conductor rides itself.
+  std::string base;
+  for (std::vector<SVRFDerivation>::const_iterator dv = m_deck.derivations.begin (); dv != m_deck.derivations.end (); ++dv) {
+    if (dv->name == gate && (dv->kind == "bool" || dv->kind == "bool_expr")) {
+      for (std::vector<std::string>::const_iterator op = dv->operands.begin (); op != dv->operands.end (); ++op) {
+        if (nodes.count (*op)) { base = *op; break; }
+      }
+      break;
+    }
+  }
+  if (base.empty () && nodes.count (gate)) {
+    base = gate;
+  }
+  if (base.empty ()) {
+    skip ("ANTENNA gate base layer not resolvable to a CONNECT node");
+    return;
+  }
+
+  //  --- BFS rank from the base (height above the gate) ----------------------
+  std::map<std::string, int> rank;
+  {
+    std::vector<std::string> q;
+    rank[base] = 0; q.push_back (base);
+    for (std::size_t h = 0; h < q.size (); ++h) {
+      const std::string u = q[h];
+      const std::set<std::string> &nb = adj[u];
+      for (std::set<std::string>::const_iterator w = nb.begin (); w != nb.end (); ++w) {
+        if (! rank.count (*w)) { rank[*w] = rank[u] + 1; q.push_back (*w); }
+      }
+    }
+  }
+  if (! rank.count (metal)) {
+    skip ("ANTENNA metal layer not reachable from the gate base");
+    return;
+  }
+  const int mrank = rank[metal];
+  auto in_stage = [&] (const std::string &n) -> bool {
+    std::map<std::string, int>::const_iterator it = rank.find (n);
+    return it != rank.end () && it->second <= mrank;
+  };
+
+  //  --- build a PRIVATE staged L2N (only conductors AT OR BELOW `metal`) -----
+  db::LayoutToNetlist l2n ("TOP", m_dbu);
+  std::map<std::string, db::Region> reg;         // stable: std::map never invalidates nodes
+  auto get = [&] (const std::string &nm) -> db::Region & {
+    std::map<std::string, db::Region>::iterator it = reg.find (nm);
+    if (it != reg.end ()) return it->second;
+    reg[nm] = resolve (nm);                       // main-thread only: cache mutation is safe
+    db::Region &ref = reg[nm];
+    l2n.register_layer (ref, nm);
+    l2n.connect (ref);                            // net-bearing (intra-layer)
+    return ref;
+  };
+  for (std::set<std::string>::const_iterator n = nodes.begin (); n != nodes.end (); ++n) {
+    if (in_stage (*n)) { get (*n); }
+  }
+  //  the gate denominator rides the base net (inter-layer connect, not self-net)
+  reg["__gate__"] = resolve (gate);
+  db::Region &greg = reg["__gate__"];
+  l2n.register_layer (greg, "__gate__");
+  l2n.connect (greg, get (base));
+  //  apply CONNECT edges restricted to the stage (a via bridges only if in-stage)
+  for (std::vector<std::tuple<std::string, std::string, std::string> >::const_iterator c = m_deck.connects.begin (); c != m_deck.connects.end (); ++c) {
+    const std::string &a = std::get<0> (*c), &b = std::get<1> (*c), &v = std::get<2> (*c);
+    if (! in_stage (a) || ! in_stage (b)) continue;
+    if (! v.empty () && in_stage (v)) {
+      l2n.connect (get (a), get (v));
+      l2n.connect (get (b), get (v));
+    } else {
+      l2n.connect (get (a), get (b));
+    }
+  }
+  db::Region &mreg = get (metal);
+
+  bool built = true;
+  try {
+    l2n.extract_netlist ();
+  } catch (tl::Exception &e) {
+    SVRFResult res; res.rule = &r; res.verdict = "ERROR";
+    std::string m = e.msg (); if (m.size () > 80) m = m.substr (0, 80);
+    res.info = m; m_results[slot] = res; built = false;
+  } catch (...) {
+    SVRFResult res; res.rule = &r; res.verdict = "ERROR";
+    res.info = "antenna extract error"; m_results[slot] = res; built = false;
+  }
+  if (! built) return;
+
+  //  --- per-net ratio = area(metal on net) / area(gate on net) --------------
+  auto cmp_bad = [&] (double ratio) -> bool {
+    if (r.cmp == "<")  return ratio <  r.value;
+    if (r.cmp == "<=") return ratio <= r.value;
+    if (r.cmp == ">=") return ratio >= r.value;
+    if (r.cmp == "==") return ratio == r.value;
+    if (r.cmp == "!=") return ratio != r.value;
+    return ratio > r.value;                        // ">" default: antenna over-limit
+  };
+  std::size_t viol = 0;
+  double worst = 0.0;
+  db::Netlist *nl = l2n.netlist ();
+  if (nl) {
+    for (db::Netlist::circuit_iterator ci = nl->begin_circuits (); ci != nl->end_circuits (); ++ci) {
+      for (db::Circuit::net_iterator net = ci->begin_nets (); net != ci->end_nets (); ++net) {
+        std::unique_ptr<db::Region> sg (l2n.shapes_of_net (*net, greg, true));
+        double ga = sg ? (double) sg->area () : 0.0;
+        if (ga <= 0.0) continue;                   // no gate -> not an antenna node
+        std::unique_ptr<db::Region> sm (l2n.shapes_of_net (*net, mreg, true));
+        double ma = sm ? (double) sm->area () : 0.0;
+        if (ma <= 0.0) continue;                   // net carries no metal at this stage
+        double ratio = ma / ga;                    // dimensionless (dbu^2 cancels)
+        if (ratio > worst) worst = ratio;
+        if (cmp_bad (ratio)) ++viol;
+      }
+    }
+  }
+
+  if (getenv ("SVRFDRC_ANTENNA_RATIO")) {
+    fprintf (stderr, "ANTENNA_RATIO %s metal=%s gate=%s stage_rank<=%d worst=%.6f cmp=%s limit=%.6f viol=%zu\n",
+             r.name.c_str (), metal.c_str (), gate.c_str (), mrank,
+             worst, r.cmp.c_str (), r.value, viol);
+  }
+  SVRFResult res; res.rule = &r;
+  res.verdict = viol == 0 ? "PASS" : "FAIL";
+  res.info = std::to_string (viol);
+  m_results[slot] = res;
 }
 
 // ---------------------------------------------------------------------------

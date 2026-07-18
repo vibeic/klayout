@@ -23,9 +23,10 @@
   plugin's _parse_svrf_tally / _classify_svrf_fails parse those exact lines.
   Freeze it; see NATIVE_CPP_PORT_ROADMAP.md "HARD CONTRACTS".
 
-  honest-SKIP doctrine (never false-PASS): ANTENNA / edge-typed-without-polygon
-  -equivalent / connectivity-without-CONNECT-stack / net layer with no extracted
-  shapes / unmodeled derivations -> emit "SKIP", never "PASS".
+  honest-SKIP doctrine (never false-PASS): gate-less one-layer ANTENNA (no geometry
+  to evaluate) / edge-typed-without-polygon -equivalent / connectivity-without-CONNECT-
+  stack / net layer with no extracted shapes / unmodeled derivations -> emit "SKIP",
+  never "PASS". (The two-layer ANTENNA <metal> <gate> form now runs natively, #20.)
 
   Contains NO vendor data.
 
@@ -358,6 +359,21 @@ private:
   //  -- connectivity (Engine._build_l2n / _l2n_nets / _net_area_ratio) -----
   void build_l2n ();
   db::Region net_area_ratio (const SVRFDerivation &d);
+
+  //  -- native in-engine ANTENNA (fork feature #20) ------------------------
+  //  Evaluates a two-layer ANTENNA rule (ANTENNA <metal> <gate> <cmp> <ratio>)
+  //  directly on db::LayoutToNetlist -- the charge-ratio SVRF op that used to be
+  //  the sole cross-tool route now runs inside the geometric core alongside every
+  //  other rule. STAGED / as-fabricated connectivity: at the etch stage of the
+  //  metal layer only the conductors AT OR BELOW it (by CONNECT-graph rank from
+  //  the gate base) form the node, so an upper-metal jumper cannot relieve a
+  //  lower-stage antenna (matches the standalone gds-antenna staged model, the
+  //  honest cross-check). Runs on the MAIN thread only (builds a private L2N and
+  //  reads shared drawn-layer state via resolve()). Per-net violation =
+  //  cmp(area(metal on net)/area(gate on net), ratio); the report count is the
+  //  number of over-limit nets. SVRFDRC_ANTENNA_RATIO=1 dumps the worst ratio to
+  //  stderr (diagnostic only; the frozen report is untouched).
+  void antenna_check (const SVRFRule &r, std::size_t slot);
 
   //  count of edge pairs converted to a violation count (EdgePairs::count)
   static size_t ep_count (const db::EdgePairs &ep) { return ep.count (); }
