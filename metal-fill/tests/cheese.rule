@@ -1,0 +1,35 @@
+// cheese.rule -- SYNTHETIC gate for cheesing / slotting (#39).
+//
+// One wide metal layer (10/0). The design-extent density (no WINDOW -> denom is
+// the design extent) of the solid 20x20 um square is 1.0; after cheesing with
+// hole=4um/wall=2um a 3x3 grid of 4x4 slots removes 144 um^2 -> 256/400 = 0.64.
+//
+//   DENS_MAX : DENSITY met1 > 0.70    max-density: FAIL on solid (1.0), PASS cheesed (0.64)
+//   DENS_HI  : DENSITY met1 > 0.6401  cheesed 0.64 is NOT > 0.6401 -> PASS  (upper bracket)
+//   DENS_LO  : DENSITY met1 > 0.6399  cheesed 0.64 IS  > 0.6399 -> FAIL     (lower bracket)
+//   W_MIN    : INTERNAL met1 < 2.0    min-width: walls are exactly 2um -> PASS (thin wall FAILs)
+//   N_MIN    : NOTCH    met1 < 2.0    min-notch: slots are 4um across  -> PASS
+//
+// DENS_HI PASS + DENS_LO FAIL bracket the engine-measured density to 0.64 (the
+// HAND-COMPUTED value). NO vendor data.
+LAYER met1 10 0
+
+DENS_MAX {
+  DENSITY met1 > 0.70
+}
+
+DENS_HI {
+  DENSITY met1 > 0.6401
+}
+
+DENS_LO {
+  DENSITY met1 > 0.6399
+}
+
+W_MIN {
+  INTERNAL met1 < 2.0
+}
+
+N_MIN {
+  NOTCH met1 < 2.0
+}
