@@ -1,0 +1,49 @@
+// vspace.rule -- SYNTHETIC (NO vendor data). Exercises voltage-aware /
+// net-voltage-dependent spacing (fork feature #12): the spacing REQUIRED between
+// two DIFFERENT nets grows with the voltage difference across the gap.
+//
+// Layer numbers are synthetic placeholders:
+//   poly 2/0  cont 3/0  met1 4/0   |   vdd18 20/0  vdd50 21/0 (voltage markers)
+//
+//   VOLTAGE <marker> <volts>   a net that TOUCHES a shape on <marker> is held at
+//                              <volts>. Unmarked nets are treated as 0 V.
+//   VSPACE <layer> < <base> PER_VOLT <k>
+//                              required(i,j) = base + k*|V_i - V_j|   [um]
+//                              violation when the measured spacing is BELOW it.
+//
+// V.SP.M1 : base 0.20 um + 0.05 um per volt of difference.
+//             1.8 V vs 1.8 V -> 0.20 + 0.05*0.0 = 0.20 um
+//             1.8 V vs 5.0 V -> 0.20 + 0.05*3.2 = 0.36 um
+//           so the SAME 0.30 um gap is legal inside one domain and illegal
+//           across the two -- the check cannot be reproduced by any single
+//           fixed-distance EXTERNAL rule.
+//
+// V.SP.M1.K0 : the identical rule with PER_VOLT 0 -> every required spacing
+//           collapses to the 0.20 um base and the layout is clean. This is the
+//           control: it proves the failure above comes from the VOLTAGE term.
+//
+// V.SP.NOK : no PER_VOLT modifier -> honest SKIP (a voltage-aware rule with no
+//           voltage term is just EXTERNAL and must not masquerade as one).
+
+LAYER poly   2 0
+LAYER cont   3 0
+LAYER met1   4 0
+LAYER vdd18 20 0
+LAYER vdd50 21 0
+
+CONNECT poly met1 BY cont
+
+VOLTAGE vdd18 1.8
+VOLTAGE vdd50 5.0
+
+V.SP.M1 {
+  VSPACE met1 < 0.20 PER_VOLT 0.05
+}
+
+V.SP.M1.K0 {
+  VSPACE met1 < 0.20 PER_VOLT 0
+}
+
+V.SP.NOK {
+  VSPACE met1 < 0.20
+}

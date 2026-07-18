@@ -378,6 +378,7 @@ const std::vector<SVRFResult> &SVRFEngine::execute ()
                          (r.op == "DENSITY") ||
                          (r.op == "ANTENNA") ||     // native antenna builds a private L2N
                          (r.op == "ERC") ||         // native ERC builds a private L2N
+                         (r.op == "VSPACE") ||      // voltage-aware spacing builds a private L2N
                          (r.connectivity != SVRFConnectivity::none);
       if (main_thread) {
         exec_rule (r, slot);                         // inline, at source position
@@ -963,6 +964,7 @@ void SVRFEngine::execute_leveled (std::size_t n_noncopy,
                          (r.op == "DENSITY") ||
                          (r.op == "ANTENNA") ||     // native antenna builds a private L2N
                          (r.op == "ERC") ||         // native ERC builds a private L2N
+                         (r.op == "VSPACE") ||      // voltage-aware spacing builds a private L2N
                          (r.connectivity != SVRFConnectivity::none);
       if (main_thread) {
         exec_rule (r, slot);
@@ -2825,6 +2827,10 @@ void SVRFEngine::exec_rule (const SVRFRule &r, std::size_t slot)
     exec_erc (r, slot);                // ERC (#13): native electrical-rule check
     return;
   }
+  if (r.op == "VSPACE") {
+    exec_vspace (r, slot);             // #12: net-voltage-dependent spacing
+    return;
+  }
 
   db::Coord d = to_dbu (r.value);
   db::EdgePairs ep;
@@ -3946,6 +3952,235 @@ void SVRFEngine::exec_erc (const SVRFRule &r, std::size_t slot)
 }
 
 // ---------------------------------------------------------------------------
+//  voltage-aware / net-voltage-dependent spacing (fork feature #12)
+// ---------------------------------------------------------------------------
+//
+//    VOLTAGE <marker-layer> <volts>          (deck statement, source order)
+//    VSPACE  <layer> <cmp> <base> PER_VOLT <k>
+//
+//  The spacing REQUIRED between two DIFFERENT nets is
+//
+//      required(i,j) = base + k * |V_i - V_j|      [um]
+//
+//  and the pair is a violation when the measured spacing is BELOW it. Each net's
+//  voltage is read from geometry: a net that touches a shape on a VOLTAGE marker
+//  layer is held at that layer's volts. This is the geometry-derivable half of
+//  Calibre's voltage-dependent DRC -- no schematic, no annotated netlist.
+//
+//  Deliberately CONSERVATIVE where the layout is ambiguous, so the check can
+//  never be false-clean:
+//    * a net touching SEVERAL markers takes the LARGEST |V| -> the LARGEST
+//      required spacing;
+//    * a net touching NO marker is treated as 0 V (the base rule still applies).
+//
+//  Solved on a PRIVATE db::LayoutToNetlist (same discipline as ANTENNA #20 and
+//  ERC #13), so the shared m_l2n and every pre-existing verdict are untouched.
+//  Pairs are enumerated over NETS (not shapes) with a bbox reject at the pair's
+//  own required distance, so only nets that could possibly interact are checked.
+
+void SVRFEngine::exec_vspace (const SVRFRule &r, std::size_t slot)
+{
+  auto skip = [&] (const std::string &why) {
+    SVRFResult res; res.rule = &r; res.verdict = "SKIP"; res.info = why;
+    m_results[slot] = res;
+  };
+  if (! r.has_per_volt) {
+    //  no voltage term -> this is just EXTERNAL; refuse to masquerade as one.
+    skip ("VSPACE needs a PER_VOLT modifier");
+    return;
+  }
+  if (m_deck.connects.empty ()) {
+    skip ("VSPACE needs a CONNECT stack for connectivity");
+    return;
+  }
+  if (m_deck.voltages.empty ()) {
+    skip ("VSPACE needs at least one VOLTAGE domain");
+    return;
+  }
+
+  std::set<std::string> nodes;
+  std::map<std::string, std::set<std::string> > adj;
+  connect_graph (nodes, adj);
+  const std::string base1 = layer_base (r.layer1, nodes);
+  if (base1.empty ()) {
+    skip ("VSPACE layer '" + r.layer1 + "' not resolvable to a CONNECT node");
+    return;
+  }
+
+  //  Materialise every operand on the shared cache BEFORE the private L2N adopts
+  //  any of them (register_layer takes over the region it is handed).
+  resolve (r.layer1);
+  for (std::set<std::string>::const_iterator n = nodes.begin (); n != nodes.end (); ++n) {
+    resolve (*n);
+  }
+  std::vector<std::pair<db::Region, double> > vmarks;      // marker geometry -> volts
+  for (std::vector<std::pair<std::string, double> >::const_iterator v = m_deck.voltages.begin (); v != m_deck.voltages.end (); ++v) {
+    if (m_unmodeled.count (v->first)) {
+      continue;                                            // unmodeled marker: ignored, never assumed
+    }
+    db::Region vr;
+    try {
+      vr = resolve (v->first);
+    } catch (...) {
+      continue;
+    }
+    if (! vr.empty ()) {
+      vmarks.push_back (std::make_pair (vr, v->second));
+    }
+  }
+  if (vmarks.empty ()) {
+    skip ("no VOLTAGE marker layer carries geometry");
+    return;
+  }
+
+  db::LayoutToNetlist l2n ("TOP", m_dbu);
+  std::map<std::string, db::Region> reg;
+  auto get = [&] (const std::string &nm) -> db::Region & {
+    std::map<std::string, db::Region>::iterator it = reg.find (nm);
+    if (it != reg.end ()) return it->second;
+    reg[nm] = resolve (nm);
+    db::Region &ref = reg[nm];
+    l2n.register_layer (ref, nm);
+    l2n.connect (ref);
+    return ref;
+  };
+  for (std::set<std::string>::const_iterator n = nodes.begin (); n != nodes.end (); ++n) {
+    get (*n);
+  }
+  for (std::vector<std::tuple<std::string, std::string, std::string> >::const_iterator c = m_deck.connects.begin (); c != m_deck.connects.end (); ++c) {
+    const std::string &a = std::get<0> (*c), &b = std::get<1> (*c), &v = std::get<2> (*c);
+    if (! v.empty ()) {
+      l2n.connect (get (a), get (v));
+      l2n.connect (get (b), get (v));
+    } else {
+      l2n.connect (get (a), get (b));
+    }
+  }
+  //  the measured layer, as a probe when it is a derived marker rather than a node
+  db::Region *meas = 0;
+  if (r.layer1 == base1) {
+    meas = &get (r.layer1);
+  } else {
+    const std::string key = "__probe_" + r.layer1 + "__";
+    reg[key] = resolve (r.layer1);
+    db::Region &ref = reg[key];
+    l2n.register_layer (ref, key);
+    l2n.connect (ref, get (base1));
+    meas = &ref;
+  }
+
+  try {
+    l2n.extract_netlist ();
+  } catch (tl::Exception &e) {
+    SVRFResult res; res.rule = &r; res.verdict = "ERROR";
+    std::string m = e.msg (); if (m.size () > 80) m = m.substr (0, 80);
+    res.info = m; m_results[slot] = res; return;
+  } catch (...) {
+    SVRFResult res; res.rule = &r; res.verdict = "ERROR";
+    res.info = "VSPACE extract error"; m_results[slot] = res; return;
+  }
+
+  //  --- per-net measured shapes + voltage ----------------------------------
+  struct VNet
+  {
+    db::Region shapes;                   // this net's shapes on the MEASURED layer
+    double volts;
+    db::Box bbox;
+    std::string name;
+  };
+  const bool dbg = getenv ("SVRFDRC_VSPACE") != 0;
+  std::vector<VNet> vnets;
+  db::Netlist *nl = l2n.netlist ();
+  if (nl) {
+    for (db::Netlist::circuit_iterator ci = nl->begin_circuits (); ci != nl->end_circuits (); ++ci) {
+      for (db::Circuit::net_iterator net = ci->begin_nets (); net != ci->end_nets (); ++net) {
+        std::unique_ptr<db::Region> sm (l2n.shapes_of_net (*net, *meas, true));
+        if (! sm || sm->empty ()) {
+          continue;                      // net carries none of the measured layer
+        }
+        //  every conductor shape of this net -- a voltage marker may be drawn over
+        //  any layer of the domain, not only the measured one.
+        db::Region all (*sm);
+        for (std::set<std::string>::const_iterator n = nodes.begin (); n != nodes.end (); ++n) {
+          std::unique_ptr<db::Region> so (l2n.shapes_of_net (*net, get (*n), true));
+          if (so && ! so->empty ()) {
+            all += *so;
+          }
+        }
+        double volts = 0.0;              // unmarked net: the base rule still applies
+        bool marked = false;
+        for (std::size_t k = 0; k < vmarks.size (); ++k) {
+          if (! all.selected_interacting (vmarks[k].first).empty ()) {
+            //  CONSERVATIVE on ambiguity: the largest magnitude wins, so a net in
+            //  two domains demands the LARGEST spacing, never the smallest.
+            if (! marked || std::fabs (vmarks[k].second) > std::fabs (volts)) {
+              volts = vmarks[k].second;
+            }
+            marked = true;
+          }
+        }
+        VNet vn;
+        vn.shapes = *sm;
+        vn.volts = volts;
+        vn.bbox = sm->bbox ();
+        vn.name = net->expanded_name ();
+        vnets.push_back (vn);
+        if (dbg) {
+          fprintf (stderr, "VSPACE %s net=%s shapes=%zu volts=%.6f%s\n",
+                   r.name.c_str (), vn.name.c_str (), (size_t) vn.shapes.count (),
+                   volts, marked ? "" : " (unmarked)");
+        }
+      }
+    }
+  }
+
+  //  --- pairwise different-net check at the pair's OWN required spacing -----
+  db::RegionCheckOptions o = check_options (r);
+  db::EdgePairs ep;
+  db::Region viol;
+  try {
+    for (std::size_t i = 0; i < vnets.size (); ++i) {
+      for (std::size_t j = i + 1; j < vnets.size (); ++j) {
+        double req = r.value + r.per_volt * std::fabs (vnets[i].volts - vnets[j].volts);
+        db::Coord d = to_dbu (req);
+        if (d <= 0) {
+          continue;
+        }
+        db::Box bi = vnets[i].bbox.enlarged (db::Vector (d, d));
+        if (! bi.touches (vnets[j].bbox)) {
+          continue;                      // cannot interact within this pair's reach
+        }
+        db::EdgePairs pe = vnets[i].shapes.separation_check (vnets[j].shapes, d, o);
+        if (dbg && pe.count () > 0) {
+          fprintf (stderr, "VSPACE %s pair %s(%.6fV)/%s(%.6fV) required=%.6f -> %zu\n",
+                   r.name.c_str (), vnets[i].name.c_str (), vnets[i].volts,
+                   vnets[j].name.c_str (), vnets[j].volts, req, (size_t) pe.count ());
+        }
+        ep += pe;
+      }
+    }
+  } catch (tl::Exception &e) {
+    SVRFResult res; res.rule = &r; res.verdict = "ERROR";
+    std::string m = e.msg (); if (m.size () > 80) m = m.substr (0, 80);
+    res.info = m; m_results[slot] = res; return;
+  } catch (...) {
+    SVRFResult res; res.rule = &r; res.verdict = "ERROR";
+    res.info = "VSPACE check error"; m_results[slot] = res; return;
+  }
+  ep.polygons (viol);
+
+  std::size_t waived = 0;
+  maybe_apply_waivers (r, ep, true, viol, waived);
+  std::size_t cnt = ep.count ();
+
+  m_regions[r.name] = viol;
+  SVRFResult res; res.rule = &r;
+  res.verdict = cnt == 0 ? "PASS" : "FAIL";
+  res.info = std::to_string (cnt);
+  m_results[slot] = res;
+}
+
+// ---------------------------------------------------------------------------
 //  report -- BYTE-IDENTICAL to run_svrf_drc.py::main()
 // ---------------------------------------------------------------------------
 
@@ -3981,6 +4216,9 @@ void SVRFEngine::write_report (const std::string &report_path, const std::string
       tag = "[metrics=" + r.metrics;
       if (r.has_ignore_angle) {
         tag += ",ignore_angle=" + py_float_str (r.ignore_angle);
+      }
+      if (r.has_per_volt) {
+        tag += ",per_volt=" + py_float_str (r.per_volt);   // #12: only VSPACE sets it
       }
       if (r.opposite) {
         tag += ",opposite";

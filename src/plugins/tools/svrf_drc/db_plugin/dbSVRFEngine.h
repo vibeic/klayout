@@ -438,6 +438,12 @@ private:
   //  derivation. Empty when the layer cannot be tied to the stack.
   std::string layer_base (const std::string &name, const std::set<std::string> &nodes) const;
 
+  //  -- voltage-aware spacing (#12) ----------------------------------------
+  //  VSPACE <layer> <cmp> <base> PER_VOLT <k>: the spacing REQUIRED between two
+  //  DIFFERENT nets is  base + k*|V1 - V2|  (um), each net's voltage read from
+  //  the deck's VOLTAGE marker layers. Solved on a PRIVATE LayoutToNetlist.
+  void exec_vspace (const SVRFRule &r, std::size_t slot);
+
   //  count of edge pairs converted to a violation count (EdgePairs::count)
   static size_t ep_count (const db::EdgePairs &ep) { return ep.count (); }
 };

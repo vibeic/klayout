@@ -76,6 +76,13 @@ struct SVRFRule
   //  other conductor at all -- an isolated island). cmp/value are unused; the
   //  reported count is the number of offending NETS. Empty for every other op.
   std::string erc_check;
+  //  Voltage-aware spacing (#12). When op == "VSPACE", the required spacing
+  //  between two DIFFERENT nets is   value + per_volt * |V1 - V2|   (um), where
+  //  each net's voltage comes from the deck's VOLTAGE marker layers. per_volt is
+  //  the PER_VOLT modifier (um per volt); without it the rule honest-SKIPs, since
+  //  a voltage-aware rule with no voltage term is just EXTERNAL.
+  bool has_per_volt = false;
+  double per_volt = 0.0;
   bool supported = true;
   std::string reason;
   std::string raw;
@@ -131,6 +138,10 @@ struct SVRFDeck
   std::vector<SVRFRule> rules;
   //  (layer_a, layer_b, via) -- via empty == None
   std::vector<std::tuple<std::string, std::string, std::string> > connects;
+  //  Voltage-aware DRC (#12): VOLTAGE <marker-layer> <volts>, in SOURCE ORDER.
+  //  A net that geometrically touches a shape on <marker-layer> is held at
+  //  <volts>. Empty for every deck that declares no voltage domain.
+  std::vector<std::pair<std::string, double> > voltages;
   std::vector<SVRFStatement> statements;
 };
 

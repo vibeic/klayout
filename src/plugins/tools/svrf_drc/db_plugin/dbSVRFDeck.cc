@@ -338,13 +338,34 @@ parse_connects (const std::string &text)
   return out;
 }
 
+// ── voltage domains (#12) ────────────────────────────────────────────────────
+
+//  VOLTAGE <marker-layer> <volts>   -- a whole-line statement like CONNECT. A net
+//  that geometrically touches a shape on <marker-layer> is held at <volts>. Signed
+//  values are allowed (a negative-bias well marker is a real domain).
+static std::vector<std::pair<std::string, double> >
+parse_voltages (const std::string &text)
+{
+  static const std::regex volt_re (
+    R"(^\s*VOLTAGE\s+([A-Za-z_][\w.$]*)\s+([+-]?[0-9]*\.?[0-9]+)\s*$)",
+    std::regex::ECMAScript | std::regex::icase);
+  std::vector<std::pair<std::string, double> > out;
+  for (const std::string &ln : splitlines (text)) {
+    std::smatch m;
+    if (std::regex_search (ln, m, volt_re, std::regex_constants::match_continuous)) {
+      out.push_back (std::make_pair (m[1].str (), std::stod (m[2].str ())));
+    }
+  }
+  return out;
+}
+
 // ── rule modifiers ──────────────────────────────────────────────────────────
 
 //  _MEAS_RE groups: 1=op 2=layer1 3=layer2? 4=cmp 5=value 6=tail
 static const std::regex &meas_re ()
 {
   static const std::regex re (
-    R"(\b(INTERNAL|INT|EXTERNAL|EXT|ENCLOSURE|ENC|WIDTH|SPACE|AREA|NOTCH|DENSITY|ANTENNA)\b\s+)"
+    R"(\b(INTERNAL|INT|EXTERNAL|EXT|ENCLOSURE|ENC|WIDTH|SPACE|AREA|NOTCH|DENSITY|ANTENNA|VSPACE)\b\s+)"
     R"(([A-Za-z_][\w.$]*)(?:\s+([A-Za-z_][\w.$]*))?\s*)"
     R"((<=|<|==|>=|>)\s*([0-9]*\.?[0-9]+)\s*(.*)$)",
     std::regex::ECMAScript | std::regex::icase);
@@ -457,8 +478,15 @@ static void parse_modifiers (SVRFRule &rule, const std::string &tail)
   static const std::regex re_singular (R"(\bSINGULAR\b)", std::regex::ECMAScript | std::regex::icase);
   static const std::regex re_notconn (R"(\bNOT\s+CONNECTED\b)", std::regex::ECMAScript | std::regex::icase);
   static const std::regex re_conn (R"(\bCONNECTED\b)", std::regex::ECMAScript | std::regex::icase);
+  //  voltage-aware spacing (#12): PER_VOLT <um-per-volt>
+  static const std::regex re_pervolt (
+    R"(\bPER_VOLT\b\s*([0-9]*\.?[0-9]+))", std::regex::ECMAScript | std::regex::icase);
 
   std::smatch m;
+  if (std::regex_search (tail, m, re_pervolt)) {
+    rule.has_per_volt = true;
+    rule.per_volt = std::stod (m[1].str ());
+  }
   if (std::regex_search (tail, re_proj)) {
     rule.metrics = "projection";
   }
@@ -1072,6 +1100,7 @@ SVRFDeck parse_deck (const std::string &text)
   SVRFDeck deck;
   deck.layers = parse_layers (t);
   deck.connects = parse_connects (t);
+  deck.voltages = parse_voltages (t);
 
   std::vector<std::string> lines = splitlines (t);
   size_t i = 0, n = lines.size ();
