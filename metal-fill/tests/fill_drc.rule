@@ -1,0 +1,15 @@
+// fill_drc.rule — synthetic space/width sign-off deck for the metal-fill gate.
+// NO vendor data: layer 34/0 and the 0.20um / 0.30um bounds are generic placeholders
+// chosen to match the fixture's fill parameters (space 0.20, width 0.50).
+// Executed natively by the fork's `svrfdrc` C++ buddy.
+
+LAYER metal1 34 0
+
+// min spacing 0.20um: correct fill (0.20 keep-out + margin) -> 0 ; too-tight fill -> >0
+SPACE.M1 {
+  EXTERNAL metal1 < 0.20 ABUT < 90 REGION
+}
+// min width 0.30um: the 0.50um fill squares pass; a sub-min sliver would fail
+WIDTH.M1 {
+  INTERNAL metal1 < 0.30 ABUT < 90 REGION
+}

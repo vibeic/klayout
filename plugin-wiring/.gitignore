@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# test-generated artifacts
+*.gds
+*.rpt
