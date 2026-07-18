@@ -142,6 +142,11 @@ struct SVRFDeck
   //  A net that geometrically touches a shape on <marker-layer> is held at
   //  <volts>. Empty for every deck that declares no voltage domain.
   std::vector<std::pair<std::string, double> > voltages;
+  //  Text/label handling (#24): LABEL <text-layer> <conductor-layer>, in SOURCE
+  //  ORDER. Attaches the text shapes on <text-layer> to the nets of
+  //  <conductor-layer> as NET NAMES (db::LayoutToNetlist::connect(Region,Texts)),
+  //  so an extracted net carries the designer's name instead of $1/$2.
+  std::vector<std::pair<std::string, std::string> > labels;
   std::vector<SVRFStatement> statements;
 };
 

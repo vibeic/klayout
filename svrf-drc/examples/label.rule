@@ -1,0 +1,32 @@
+// label.rule -- SYNTHETIC (NO vendor data). Exercises text/label handling
+// (fork feature #24): TEXT/LABEL/ATTACH/PORT layers wired to NET NAMES, plus the
+// label-short electrical check built on top of them.
+//
+// Layer numbers are synthetic placeholders:
+//   poly 2/0  cont 3/0  met1 4/0   |   netname 40/0 (TEXT shapes)
+//
+//   LABEL <text-layer> <conductor-layer>
+//       attaches the text shapes on <text-layer> to <conductor-layer>'s nets as
+//       NET NAMES (db::LayoutToNetlist::connect(Region, Texts)), so an extracted
+//       net carries the designer's name instead of $1/$2. ATTACH and PORT are
+//       accepted as synonyms.
+//
+//   ERC SHORT <text-layer>
+//       ONE extracted net carrying TWO DIFFERENT names is a label short / net
+//       name clash -- the two nets the designer named separately are physically
+//       one. Count = the number of such nets; the marker is the whole shorted
+//       net, so the debug geometry is the conductor to cut.
+//       Two labels bearing the SAME string on one net are NOT a clash.
+
+LAYER poly    2 0
+LAYER cont    3 0
+LAYER met1    4 0
+LAYER netname 40 0
+
+CONNECT poly met1 BY cont
+
+LABEL netname met1
+
+ERC.NAMESHORT {
+  ERC SHORT netname
+}

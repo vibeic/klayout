@@ -3794,6 +3794,37 @@ std::string SVRFEngine::layer_base (const std::string &name, const std::set<std:
   return std::string ();
 }
 
+//  Text/label handling (#24): read the layout's TEXT shapes on a declared text
+//  layer. `all` is every label (fed to LayoutToNetlist::connect so extracted nets
+//  carry the designer's name); `by_string` holds one db::Texts per DISTINCT label
+//  string, so a net can be asked "do you carry the name VDD?" independently of
+//  how the netlister resolves a net that carries two names.
+void SVRFEngine::collect_texts (const std::string &layer_name, db::Texts &all,
+                                std::map<std::string, db::Texts> &by_string) const
+{
+  std::map<std::string, std::vector<std::pair<int, int> > >::const_iterator b = m_deck.layers.find (layer_name);
+  if (b == m_deck.layers.end ()) {
+    return;
+  }
+  const db::Cell &cell = m_layout.cell (m_top);
+  for (std::vector<std::pair<int, int> >::const_iterator pd = b->second.begin (); pd != b->second.end (); ++pd) {
+    unsigned int li = const_cast<db::Layout &> (m_layout).get_layer (db::LayerProperties (pd->first, pd->second));
+    db::RecursiveShapeIterator si (m_layout, cell, li);
+    si.shape_flags (db::ShapeIterator::Texts);
+    for ( ; ! si.at_end (); ++si) {
+      const db::Shape &sh = *si;
+      if (! sh.is_text ()) {
+        continue;
+      }
+      db::Text t;
+      sh.text (t);
+      t.transform (si.trans ());
+      all.insert (t);
+      by_string[std::string (t.string ())].insert (t);
+    }
+  }
+}
+
 void SVRFEngine::exec_erc (const SVRFRule &r, std::size_t slot)
 {
   auto skip = [&] (const std::string &why) {
@@ -3809,15 +3840,34 @@ void SVRFEngine::exec_erc (const SVRFRule &r, std::size_t slot)
   std::map<std::string, std::set<std::string> > adj;
   connect_graph (nodes, adj);
 
+  //  ERC SHORT operates on a TEXT layer, not a conductor: two DIFFERENT net names
+  //  landing on ONE extracted net is a label short / name clash.
+  const bool label_short = (r.erc_check == "SHORT");
+  db::Texts all_texts;
+  std::map<std::string, db::Texts> texts_by_name;
+  if (label_short) {
+    if (! m_deck.layers.count (r.layer1)) {
+      skip ("ERC SHORT layer '" + r.layer1 + "' is not a declared text layer");
+      return;
+    }
+    collect_texts (r.layer1, all_texts, texts_by_name);
+    if (texts_by_name.size () < 2) {
+      //  fewer than two DISTINCT names in the whole layout: no clash is possible
+      //  and asserting PASS would be vacuous.
+      skip ("ERC SHORT needs at least two distinct net names on '" + r.layer1 + "'");
+      return;
+    }
+  }
+
   //  Every operand must be tie-able to the CONNECT stack, else there is no
   //  electrical question to answer -> honest SKIP, never PASS.
-  const std::string base1 = layer_base (r.layer1, nodes);
+  const std::string base1 = label_short ? std::string ("-") : layer_base (r.layer1, nodes);
   if (base1.empty ()) {
     skip ("ERC layer '" + r.layer1 + "' not resolvable to a CONNECT node");
     return;
   }
   std::string base2;
-  if (! r.layer2.empty ()) {
+  if (! label_short && ! r.layer2.empty ()) {
     base2 = layer_base (r.layer2, nodes);
     if (base2.empty ()) {
       skip ("ERC layer '" + r.layer2 + "' not resolvable to a CONNECT node");
@@ -3830,8 +3880,10 @@ void SVRFEngine::exec_erc (const SVRFRule &r, std::size_t slot)
   //  handed to the private L2N: db::LayoutToNetlist::register_layer() adopts the
   //  region it is given, and a later resolve() of a derivation whose operands
   //  were already adopted would evaluate to empty.
-  resolve (r.layer1);
-  if (! r.layer2.empty ()) { resolve (r.layer2); }
+  if (! label_short) {
+    resolve (r.layer1);
+    if (! r.layer2.empty ()) { resolve (r.layer2); }
+  }
   for (std::set<std::string>::const_iterator n = nodes.begin (); n != nodes.end (); ++n) {
     resolve (*n);
   }
@@ -3874,10 +3926,34 @@ void SVRFEngine::exec_erc (const SVRFRule &r, std::size_t slot)
     l2n.connect (ref, get (base));                 // rides the base net; never bridges
     return ref;
   };
-  db::Region &p1 = probe (r.layer1, base1);
+  db::Region *p1 = 0;
   db::Region *p2 = 0;
-  if (! r.layer2.empty ()) {
-    p2 = &probe (r.layer2, base2);
+  if (! label_short) {
+    p1 = &probe (r.layer1, base1);
+    if (! r.layer2.empty ()) {
+      p2 = &probe (r.layer2, base2);
+    }
+  }
+
+  //  #24: attach the deck's LABEL statements so extracted nets carry the
+  //  designer's names. The db::Texts objects must outlive extract_netlist().
+  std::map<std::string, db::Texts> label_texts;
+  for (std::vector<std::pair<std::string, std::string> >::const_iterator lb = m_deck.labels.begin (); lb != m_deck.labels.end (); ++lb) {
+    if (! nodes.count (lb->second)) {
+      continue;                                    // label targets a non-conductor
+    }
+    std::map<std::string, db::Texts>::iterator lt = label_texts.find (lb->first);
+    if (lt == label_texts.end ()) {
+      db::Texts tx;
+      std::map<std::string, db::Texts> ignore;
+      collect_texts (lb->first, tx, ignore);
+      lt = label_texts.insert (std::make_pair (lb->first, tx)).first;
+    }
+    if (lt->second.empty ()) {
+      continue;
+    }
+    l2n.register_layer (lt->second, "__label_" + lb->first + "__");
+    l2n.connect (get (lb->second), lt->second);
   }
 
   try {
@@ -3900,7 +3976,41 @@ void SVRFEngine::exec_erc (const SVRFRule &r, std::size_t slot)
   if (nl) {
     for (db::Netlist::circuit_iterator ci = nl->begin_circuits (); ci != nl->end_circuits (); ++ci) {
       for (db::Circuit::net_iterator net = ci->begin_nets (); net != ci->end_nets (); ++net) {
-        std::unique_ptr<db::Region> s1 (l2n.shapes_of_net (*net, p1, true));
+        if (label_short) {
+          //  union of every conductor shape on this net, then ask which DISTINCT
+          //  names land on it. Two or more -> the two named nets are shorted.
+          db::Region all;
+          for (std::set<std::string>::const_iterator n = nodes.begin (); n != nodes.end (); ++n) {
+            std::unique_ptr<db::Region> so (l2n.shapes_of_net (*net, get (*n), true));
+            if (so && ! so->empty ()) {
+              all += *so;
+            }
+          }
+          if (all.empty ()) {
+            continue;
+          }
+          std::vector<std::string> hits;
+          for (std::map<std::string, db::Texts>::const_iterator tn = texts_by_name.begin (); tn != texts_by_name.end (); ++tn) {
+            if (! all.selected_interacting (tn->second).empty ()) {
+              hits.push_back (tn->first);
+            }
+          }
+          if (dbg) {
+            std::string names;
+            for (std::size_t h = 0; h < hits.size (); ++h) { names += (h ? "," : "") + hits[h]; }
+            fprintf (stderr, "ERCNET %s check=SHORT net=%s names=[%s] -> %s\n",
+                     r.name.c_str (), net->expanded_name ().c_str (), names.c_str (),
+                     hits.size () > 1 ? "VIOLATION" : "ok");
+          }
+          if (hits.size () > 1) {
+            ++nviol;
+            //  ONE marker per shorted net: the drawn shapes abut, so merging them
+            //  yields the net's actual extent rather than a pile of fragments.
+            viol += all.merged ();
+          }
+          continue;
+        }
+        std::unique_ptr<db::Region> s1 (l2n.shapes_of_net (*net, *p1, true));
         if (! s1 || s1->empty ()) {
           continue;                                // this net does not carry layer1
         }

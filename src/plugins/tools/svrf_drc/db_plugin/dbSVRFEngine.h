@@ -41,6 +41,7 @@
 #include "dbRegion.h"
 #include "dbEdges.h"
 #include "dbEdgePairs.h"
+#include "dbTexts.h"
 #include "dbLayoutToNetlist.h"
 
 #include "tlThreads.h"
@@ -430,6 +431,11 @@ private:
   //  db::LayoutToNetlist built from the deck's CONNECT stack so the shared L2N
   //  (and therefore every pre-existing rule's verdict) is never perturbed.
   void exec_erc (const SVRFRule &r, std::size_t slot);
+  //  Text/label handling (#24): collect the layout's text shapes on a declared
+  //  text layer -- `all` is every label, `by_string` one db::Texts per DISTINCT
+  //  label string (so a net can be tested against each name independently).
+  void collect_texts (const std::string &layer_name, db::Texts &all,
+                      std::map<std::string, db::Texts> &by_string) const;
   //  Undirected CONNECT graph: node set + adjacency (vias are nodes too).
   void connect_graph (std::set<std::string> &nodes,
                       std::map<std::string, std::set<std::string> > &adj) const;

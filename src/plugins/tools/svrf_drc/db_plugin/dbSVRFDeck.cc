@@ -359,6 +359,27 @@ parse_voltages (const std::string &text)
   return out;
 }
 
+// ── text / label attachment (#24) ────────────────────────────────────────────
+
+//  LABEL <text-layer> <conductor-layer>  -- a whole-line statement like CONNECT.
+//  ATTACH and PORT are accepted as synonyms (the same operation under Calibre's
+//  and the OA/LEF vocabularies).
+static std::vector<std::pair<std::string, std::string> >
+parse_labels (const std::string &text)
+{
+  static const std::regex label_re (
+    R"(^\s*(?:LABEL|ATTACH|PORT)\s+([A-Za-z_][\w.$]*)\s+([A-Za-z_][\w.$]*)\s*$)",
+    std::regex::ECMAScript | std::regex::icase);
+  std::vector<std::pair<std::string, std::string> > out;
+  for (const std::string &ln : splitlines (text)) {
+    std::smatch m;
+    if (std::regex_search (ln, m, label_re, std::regex_constants::match_continuous)) {
+      out.push_back (std::make_pair (m[1].str (), m[2].str ()));
+    }
+  }
+  return out;
+}
+
 // ── rule modifiers ──────────────────────────────────────────────────────────
 
 //  _MEAS_RE groups: 1=op 2=layer1 3=layer2? 4=cmp 5=value 6=tail
@@ -413,13 +434,15 @@ static SVRFRule make_property_rule (const std::string &name, const std::smatch &
 //  ERC (#13) recognizer. Groups: 1=sub-check 2=layer1 3=layer2?
 //    ERC FLOATING    <layer> <tie-layer>      -- net carries <layer> but never <tie>
 //    ERC UNCONNECTED <layer>                  -- net carries <layer> and nothing else
+//    ERC SHORT       <text-layer>             -- ONE net carries TWO different net
+//                                                names (a label short / name clash)
 //  Anchored to end-of-string like the other whole-statement recognizers. The op
 //  carries NO cmp/value: an ERC statement states the error CONDITION itself, so
 //  the reported count is simply the number of offending nets (PASS iff 0).
 static const std::regex &erc_re ()
 {
   static const std::regex re (
-    R"(\bERC\b\s+(FLOATING|UNCONNECTED)\s+([A-Za-z_][\w.$]*)(?:\s+([A-Za-z_][\w.$]*))?\s*$)",
+    R"(\bERC\b\s+(FLOATING|UNCONNECTED|SHORT)\s+([A-Za-z_][\w.$]*)(?:\s+([A-Za-z_][\w.$]*))?\s*$)",
     std::regex::ECMAScript | std::regex::icase);
   return re;
 }
@@ -1101,6 +1124,7 @@ SVRFDeck parse_deck (const std::string &text)
   deck.layers = parse_layers (t);
   deck.connects = parse_connects (t);
   deck.voltages = parse_voltages (t);
+  deck.labels = parse_labels (t);
 
   std::vector<std::string> lines = splitlines (t);
   size_t i = 0, n = lines.size ();
