@@ -4,10 +4,29 @@ An **independent, authoritative** process-antenna sign-off gate that runs on the
 *streamed GDS geometry* — not on a router report. It reconstructs the as-fabricated
 conductor connectivity with KLayout's own `LayoutToNetlist` engine and, for every metal
 layer, computes the per-net **antenna ratio** = (connected metal area) / (connected
-gate area). A net whose ratio exceeds the per-layer limit is a violation.
+gate area). A net whose ratio exceeds the per-layer limit is a violation. It also runs
+**cumulative-antenna-area (CAA)** checking — the charge-sharing sum of ALL interconnect
+conductor (metal + via + contact) up each stage against a separate cumulative bound.
 
 **Commercial equivalent:** Calibre antenna (PERC / nmDRC) authoritative GDS-level ratio
-checks — the plasma-charge / process-antenna sign-off gate.
+checks + Calibre **cumulative antenna** — the plasma-charge / process-antenna sign-off
+gate.
+
+## Cumulative antenna area (CAA)
+
+The per-layer ratio only weighs the single metal layer being etched. The real hazard is
+the total charge shared onto the gate by the WHOLE connected conductor node at each etch
+stage. CAA models that: for each stage `k` it sums the area of every interconnect
+conductor (roles `metal` / `via` / `contact`) connected up to & including `k` and divides
+by the gate area, testing a **separate** `cumulative_ratio` bound. Because it sums across
+layers (and counts vias), a net can pass **every** per-layer metal ratio yet fail
+cumulative — the antenna class the per-layer check structurally cannot see. CAA runs
+alongside the per-layer ratio (both reported); enable it by supplying a `cumulative_ratio`
+(per-metal or top-level). With none set, CAA is OFF and the output is byte-identical to
+the per-layer-only tool. See `antenna_config_caa.example.json` (CAA on) and
+`antenna_config_perlayer.example.json` (the companion per-layer deck the same design
+passes). Test #5 proves CAA catches what per-layer misses (cumulative 60.18 > 50 on a
+design whose every metal ratio is 30 < 40).
 
 ## The gap this closes
 
@@ -37,11 +56,13 @@ commercial-parity extension (Calibre PERC does it via a diode layer + connectivi
 
 | file | role |
 |---|---|
-| `antenna_check.py` | KLayout-driven checker (staged connectivity, per-layer + cumulative). Run via `klayout -b -r` / the fork's `strmrun`. |
+| `antenna_check.py` | KLayout-driven checker (staged connectivity, per-layer ratio + CAA cumulative). Run via `klayout -b -r` / the fork's `strmrun`. |
 | `xcheck_router.py` | pure-Python cross-check of the deck's count vs the OpenROAD `check_antennas` count. Hard gate = clean/dirty agreement. |
 | `gen_fixtures.py` | synthetic NDA-clean fixture generator (hand-computable ratios). |
-| `antenna_config.example.json` | example deck config (synthetic layer numbers). |
-| `tests/run_antenna_tests.sh` | the unfakeable gate (4 checks). |
+| `antenna_config.example.json` | example per-layer deck config (synthetic layer numbers). |
+| `antenna_config_caa.example.json` | example CAA (cumulative-antenna) deck config. |
+| `antenna_config_perlayer.example.json` | companion true-per-layer deck (CAA off) for the CAA proof. |
+| `tests/run_antenna_tests.sh` | the unfakeable gate (6 checks, incl. CAA). |
 
 ## Run
 
@@ -65,7 +86,10 @@ generic placeholders).
 2. a clean ratio-10 structure **PASSes**;
 3. the **staged model** keeps the met1-stage ratio at 50.0 even when a big met2 jumper
    is present (the jumper does not exist yet at the met1 etch stage);
-4. the router **cross-check AGREEs** on clean/dirty, and a disagreement is caught.
+4. the router **cross-check AGREEs** on clean/dirty, and a disagreement is caught;
+5. **CAA** flags a design that passes every per-layer metal ratio (30 < 40) but exceeds
+   the cumulative bound (60.18 > 50) — proving CAA is not the per-layer check, with the
+   reported cumulative ratio equal to the hand-computed 60.18.
 
 The test skips (green) if no KLayout binary is on `PATH`.
 

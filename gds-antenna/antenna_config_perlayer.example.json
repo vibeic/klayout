@@ -1,0 +1,14 @@
+{
+  "_comment": "Synthetic (NDA-clean) TRUE per-layer antenna deck: metric='layer' checks each metal layer's own ratio only, and NO 'cumulative_ratio' is set so CAA is OFF. Companion to antenna_config_caa.example.json — the same design passes here (every metal under its per-layer 'ratio') yet fails the CAA deck, proving CAA is not the per-layer check.",
+  "gate": {"and": ["poly", "active"]},
+  "gate_layers": {"poly": [2, 0], "active": [1, 0]},
+  "conductors": [
+    {"name": "poly", "layer": [2, 0], "role": "poly"},
+    {"name": "cont", "layer": [3, 0], "role": "contact"},
+    {"name": "met1", "layer": [4, 0], "role": "metal", "ratio": 40.0},
+    {"name": "via1", "layer": [5, 0], "role": "via"},
+    {"name": "met2", "layer": [6, 0], "role": "metal", "ratio": 40.0}
+  ],
+  "metric": "layer",
+  "diode_credit": false
+}

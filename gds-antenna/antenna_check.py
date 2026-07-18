@@ -36,6 +36,27 @@ Metric (per-layer window)
 * ``"layer"``      ratio_k(net) = area(metal_k on net) / gate_area(net)
 * ``"cumulative"`` ratio_k(net) = sum(area(metal_j on net), j<=k) / gate_area(net)
 
+CAA — Cumulative Antenna Area (a SEPARATE, first-class check, #44)
+-----------------------------------------------------------------
+The per-layer ratio only weighs the ONE metal layer being etched. The real
+process-antenna hazard is the CHARGE SHARED onto the gate by the ENTIRE connected
+conductor node that exists at each etch stage — every metal AND every via/contact
+beneath it. Cumulative-antenna-area checking (Calibre "cumulative antenna") models
+that: for each stage ``k`` it accumulates the area of ALL interconnect conductor
+(``role`` in ``metal`` / ``via`` / ``contact``) connected up to & including ``k`` and
+divides by the gate area, then compares against a SEPARATE cumulative limit:
+
+    CAA_k(net) = sum(area(cond_j on net), j<=k, cond_j is interconnect) / gate_area(net)
+
+Because CAA sums across layers (and includes vias) against its own bound, a net can
+pass EVERY per-layer metal ratio yet FAIL cumulative — which is exactly the class of
+antenna violation the per-layer check structurally cannot see. CAA runs ALONGSIDE the
+per-layer ratio (both are reported); the verdict fails if EITHER trips.
+
+CAA is enabled purely by supplying a cumulative limit — a per-metal ``cumulative_ratio``
+on a conductor, or a top-level ``cumulative_ratio``. With no cumulative limit anywhere,
+CAA is OFF and the output is byte-identical to the per-layer-only tool.
+
 Config (chip/PDK-AGNOSTIC — layer numbers + generic limits supplied by the caller):
     {
       "gate":       {"and": ["poly", "active"]},   // gate = poly AND active
@@ -47,12 +68,15 @@ Config (chip/PDK-AGNOSTIC — layer numbers + generic limits supplied by the cal
          {"name":"via1", "layer":[5,0], "role":"via"},
          {"name":"met2", "layer":[6,0], "role":"metal", "ratio":40.0}
       ],
-      "metric":       "cumulative",
-      "diode_credit": false
+      "metric":          "layer",
+      "cumulative_ratio": 50.0,                    // CAA bound (optional; enables CAA)
+      "diode_credit":     false
     }
 A ``contact``/``via`` role bridges the conductor immediately before and after it in the
 list. A ``metal`` role carries a ``ratio`` limit (the per-layer antenna ratio bound —
-a generic, DISCLOSED bound unless the caller supplies the foundry number).
+a generic, DISCLOSED bound unless the caller supplies the foundry number). The CAA
+numerator sums the conductor roles named in ``cumulative_roles`` (default
+``["metal","via","contact"]``).
 
 Invocation (KLayout has no argv for scripts — parameters come from the environment):
     ANT_GDS=<in.gds> ANT_CONFIG=<cfg.json> ANT_OUT=<out.json> [ANT_CELL=<top>] \
@@ -61,7 +85,13 @@ Invocation (KLayout has no argv for scripts — parameters come from the environ
 Output JSON (also printed):
     {"verdict":"PASS"|"FAIL", "worst_ratio":..., "violations":N,
      "per_layer":{"met1":{"limit":40.0,"worst_ratio":50.0,"violations":1,
-                          "detail":[{"metal_um2":..,"gate_um2":..,"ratio":..}]}}, ...}
+                          "detail":[{"metal_um2":..,"gate_um2":..,"ratio":..}],
+                          "cumulative_check":{"limit":50.0,"worst_ratio":60.18,
+                              "violations":1,"detail":[{"cumulative_um2":..,
+                              "gate_um2":..,"ratio":..,"components":{..}}]}}},
+     "caa":{"enabled":true,"worst_cumulative_ratio":..,"cumulative_violations":N}, ...}
+The ``cumulative_check`` sub-block and top-level ``caa`` appear only when a cumulative
+limit is configured (CAA enabled).
 
 §4.05 honest-failure: a missing/empty GDS or a config that yields no gate area is an
 error/HONEST-SKIP, never a vacuous PASS. A metal layer whose net has gate area and a
@@ -117,9 +147,18 @@ def run(gds, cfg, cell_name=None):
     gate_and = cfg.get("gate", {}).get("and")
     gl = cfg.get("gate_layers", {})
 
+    # CAA (cumulative antenna area, #44): the numerator accumulates every interconnect
+    # conductor (roles below) up each stage; enabled only when a cumulative limit is
+    # supplied (per-metal "cumulative_ratio" or top-level "cumulative_ratio").
+    cum_roles = cfg.get("cumulative_roles", ["metal", "via", "contact"])
+    top_caa_limit = cfg.get("cumulative_ratio")
+
     per_layer = {}
     worst_overall = 0.0
     total_viol = 0
+    caa_enabled = False
+    caa_worst_overall = 0.0
+    caa_total_viol = 0
 
     # Rebuild the connectivity for each metal STAGE k (staged / as-fabricated).
     for k_name in metals:
@@ -166,10 +205,19 @@ def run(gds, cfg, cell_name=None):
         l2n.extract_netlist()
         nl = l2n.netlist()
 
-        limit = float(next(c["ratio"] for c in conductors if c["name"] == k_name))
+        k_conf = next(c for c in conductors if c["name"] == k_name)
+        limit = float(k_conf["ratio"])
         metal_layers_upto = [c["name"] for c in stage if c.get("role") == "metal"]
+        # CAA: the SEPARATE cumulative bound + the interconnect layers that share
+        # charge onto the gate at this stage (metal + via + contact by default).
+        caa_limit = k_conf.get("cumulative_ratio", top_caa_limit)
+        caa_on = caa_limit is not None
+        caa_limit = float(caa_limit) if caa_on else None
+        cum_layers = [c["name"] for c in stage if c.get("role") in cum_roles]
         worst = 0.0
         detail = []
+        caa_worst = 0.0
+        caa_detail = []
         for ckt in nl.each_circuit():
             for net in ckt.each_net():
                 ga = _net_area(l2n, net, gate, dbu2, pya)
@@ -194,11 +242,36 @@ def run(gds, cfg, cell_name=None):
                     detail.append({"metal_um2": round(ma, 4),
                                    "gate_um2": round(ga, 4),
                                    "ratio": round(ratio, 4)})
+                # CAA: accumulate ALL interconnect conductor on this net up to the
+                # current stage (the charge-sharing node) and test the cumulative
+                # bound. This is what catches a net that clears every per-layer metal
+                # ratio but whose summed conductor charge still over-stresses the gate.
+                if caa_on:
+                    comp = {m: round(_net_area(l2n, net, regs[m], dbu2, pya), 4)
+                            for m in cum_layers}
+                    cum_area = sum(comp.values())
+                    caa_ratio = cum_area / ga
+                    caa_worst = max(caa_worst, caa_ratio)
+                    if caa_ratio > caa_limit:
+                        caa_detail.append({"cumulative_um2": round(cum_area, 4),
+                                           "gate_um2": round(ga, 4),
+                                           "ratio": round(caa_ratio, 4),
+                                           "components": comp})
         detail.sort(key=lambda d: -d["ratio"])
-        per_layer[k_name] = {"limit": limit, "metric": metric,
-                             "worst_ratio": round(worst, 4),
-                             "violations": len(detail),
-                             "detail": detail[:20]}
+        pl = {"limit": limit, "metric": metric,
+              "worst_ratio": round(worst, 4),
+              "violations": len(detail),
+              "detail": detail[:20]}
+        if caa_on:
+            caa_enabled = True
+            caa_detail.sort(key=lambda d: -d["ratio"])
+            pl["cumulative_check"] = {"limit": caa_limit, "roles": cum_roles,
+                                      "worst_ratio": round(caa_worst, 4),
+                                      "violations": len(caa_detail),
+                                      "detail": caa_detail[:20]}
+            caa_worst_overall = max(caa_worst_overall, caa_worst)
+            caa_total_viol += len(caa_detail)
+        per_layer[k_name] = pl
         worst_overall = max(worst_overall, worst)
         total_viol += len(detail)
 
@@ -209,10 +282,15 @@ def run(gds, cfg, cell_name=None):
     # §4.05: if NO net anywhere had gate area, the geometry/config is wrong -> not PASS
     any_gate = any(pl["worst_ratio"] > 0.0 or pl["violations"] > 0
                    for pl in per_layer.values())
-    verdict = "PASS" if total_viol == 0 else "FAIL"
+    # verdict fails if EITHER the per-layer ratio OR the cumulative (CAA) bound trips.
+    verdict = "PASS" if (total_viol == 0 and caa_total_viol == 0) else "FAIL"
     res = {"verdict": verdict, "gds": gds, "worst_ratio": round(worst_overall, 4),
            "violations": total_viol, "per_layer": per_layer,
            "diode_credit": diode_credit}
+    if caa_enabled:
+        res["caa"] = {"enabled": True,
+                      "worst_cumulative_ratio": round(caa_worst_overall, 4),
+                      "cumulative_violations": caa_total_viol}
     if not any_gate:
         res["verdict"] = "HONEST_SKIP"
         res["note"] = ("no net carried gate area — check the gate/layer config "
