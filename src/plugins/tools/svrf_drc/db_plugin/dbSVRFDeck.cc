@@ -389,6 +389,53 @@ static SVRFRule make_property_rule (const std::string &name, const std::smatch &
   return r;
 }
 
+//  ERC (#13) recognizer. Groups: 1=sub-check 2=layer1 3=layer2?
+//    ERC FLOATING    <layer> <tie-layer>      -- net carries <layer> but never <tie>
+//    ERC UNCONNECTED <layer>                  -- net carries <layer> and nothing else
+//  Anchored to end-of-string like the other whole-statement recognizers. The op
+//  carries NO cmp/value: an ERC statement states the error CONDITION itself, so
+//  the reported count is simply the number of offending nets (PASS iff 0).
+static const std::regex &erc_re ()
+{
+  static const std::regex re (
+    R"(\bERC\b\s+(FLOATING|UNCONNECTED)\s+([A-Za-z_][\w.$]*)(?:\s+([A-Za-z_][\w.$]*))?\s*$)",
+    std::regex::ECMAScript | std::regex::icase);
+  return re;
+}
+
+static std::string upper_copy (const std::string &s)
+{
+  std::string o (s);
+  for (std::string::iterator c = o.begin (); c != o.end (); ++c) {
+    if (*c >= 'a' && *c <= 'z') { *c = char (*c - 'a' + 'A'); }
+  }
+  return o;
+}
+
+static SVRFRule make_erc_rule (const std::string &name, const std::smatch &m)
+{
+  SVRFRule r;
+  r.name = name;
+  r.op = "ERC";
+  r.erc_check = upper_copy (m[1].str ());
+  r.layer1 = m[2].str ();
+  r.layer2 = m[3].matched ? m[3].str () : std::string ();
+  {
+    std::string full = m[0].str ();
+    size_t a = full.find_first_not_of (" \t\r\n\f\v");
+    size_t b = full.find_last_not_of (" \t\r\n\f\v");
+    r.raw = (a == std::string::npos) ? std::string () : full.substr (a, b - a + 1);
+  }
+  //  FLOATING needs both operands; a one-operand FLOATING has no tie to look for.
+  if (r.erc_check == "FLOATING" && r.layer2.empty ()) {
+    r.supported = false;
+    r.reason = "ERC FLOATING needs a tie/driver layer";
+  } else {
+    r.supported = true;
+  }
+  return r;
+}
+
 static void parse_modifiers (SVRFRule &rule, const std::string &tail)
 {
   static const std::regex re_proj (
@@ -1052,7 +1099,14 @@ SVRFDeck parse_deck (const std::string &text)
       } else {
         std::smatch pm;
         std::smatch cp;
-        if (std::regex_search (joined, pm, prop_re ())) {
+        std::smatch em;
+        if (std::regex_search (joined, em, erc_re ())) {
+          //  ERC (#13): ERC <check> <layer> [<layer2>]
+          SVRFRule r = make_erc_rule (name, em);
+          size_t idx = deck.rules.size ();
+          deck.rules.push_back (r);
+          deck.statements.push_back ({SVRFStatement::Rule, idx});
+        } else if (std::regex_search (joined, pm, prop_re ())) {
           //  eqDRC (#8): PROPERTY <layer> <expr> <cmp> <value>
           SVRFRule r = make_property_rule (name, pm);
           size_t idx = deck.rules.size ();
@@ -1093,8 +1147,15 @@ SVRFDeck parse_deck (const std::string &text)
       }
       std::smatch mm;
       std::smatch pm;
+      std::smatch em;
       if (std::regex_search (rhs_stripped, mm, meas_re (), std::regex_constants::match_continuous)) {
         SVRFRule r = make_rule (ah[1].str (), mm);
+        size_t idx = deck.rules.size ();
+        deck.rules.push_back (r);
+        deck.statements.push_back ({SVRFStatement::Rule, idx});
+      } else if (std::regex_search (rhs_stripped, em, erc_re (), std::regex_constants::match_continuous)) {
+        //  ERC (#13) assignment form:  NAME = ERC <check> <layer> [<layer2>]
+        SVRFRule r = make_erc_rule (ah[1].str (), em);
         size_t idx = deck.rules.size ();
         deck.rules.push_back (r);
         deck.statements.push_back ({SVRFStatement::Rule, idx});

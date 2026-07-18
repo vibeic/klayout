@@ -425,6 +425,19 @@ private:
   //  stderr (diagnostic only; the frozen report is untouched).
   void antenna_check (const SVRFRule &r, std::size_t slot);
 
+  //  -- native ERC (#13) ---------------------------------------------------
+  //  ERC FLOATING <layer> <tie> / ERC UNCONNECTED <layer>, solved on a PRIVATE
+  //  db::LayoutToNetlist built from the deck's CONNECT stack so the shared L2N
+  //  (and therefore every pre-existing rule's verdict) is never perturbed.
+  void exec_erc (const SVRFRule &r, std::size_t slot);
+  //  Undirected CONNECT graph: node set + adjacency (vias are nodes too).
+  void connect_graph (std::set<std::string> &nodes,
+                      std::map<std::string, std::set<std::string> > &adj) const;
+  //  The CONNECT-stack conductor a (possibly derived) marker layer rides: the
+  //  layer itself when it IS a node, else the node operand of its bool/bool_expr
+  //  derivation. Empty when the layer cannot be tied to the stack.
+  std::string layer_base (const std::string &name, const std::set<std::string> &nodes) const;
+
   //  count of edge pairs converted to a violation count (EdgePairs::count)
   static size_t ep_count (const db::EdgePairs &ep) { return ep.count (); }
 };

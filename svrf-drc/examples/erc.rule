@@ -1,0 +1,45 @@
+// erc.rule -- SYNTHETIC (NO vendor data). Exercises the native in-engine ERC op
+// (fork feature #13): electrical rule checks derived from GEOMETRY + the deck's
+// own CONNECT stack, with NO schematic and NO netlist input.
+//
+// Layer numbers are synthetic placeholders (same convention as antenna.rule):
+//   active 1/0  poly 2/0  cont 3/0  met1 4/0  via1 5/0  met2 6/0
+//
+// gate = poly AND active   -- the transistor gate marker; NOT a conductor, it
+//                             rides the poly net it sits on.
+// tie  = met1 AND cont     -- a tie-down / driver contact marker: the net has
+//                            reached a real contact up to metal; rides met1.
+//
+// Stack connectivity (bottom -> top): poly -(cont)- met1 -(via1)- met2
+//
+//   ERC FLOATING gate tie   : a net that carries a gate but NEVER reaches a tie
+//                             (floating gate / missing tie-down). Count = nets.
+//   ERC UNCONNECTED met1    : a met1 island whose net carries no other conductor
+//                             at all -- wired to nothing.
+//   ERC FLOATING gate       : one-operand form -> honest SKIP (no tie to seek).
+
+LAYER active 1 0
+LAYER poly   2 0
+LAYER cont   3 0
+LAYER met1   4 0
+LAYER via1   5 0
+LAYER met2   6 0
+
+gate = poly AND active
+tie  = met1 AND cont
+
+CONNECT poly met1 BY cont
+CONNECT met1 met2 BY via1
+
+ERC.FLOATGATE {
+  ERC FLOATING gate tie
+}
+
+ERC.ISLAND {
+  ERC UNCONNECTED met1
+}
+
+// one-operand FLOATING -> no tie layer to look for -> honest SKIP, never PASS.
+ERC.NOTIE {
+  ERC FLOATING gate
+}

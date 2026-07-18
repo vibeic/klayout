@@ -27,6 +27,7 @@
 #include "dbBox.h"
 
 #include "tlStream.h"
+#include "tlString.h"
 #include "tlVariant.h"
 #include "tlException.h"
 #include "tlThreads.h"
@@ -376,6 +377,7 @@ const std::vector<SVRFResult> &SVRFEngine::execute ()
                          dup_name ||
                          (r.op == "DENSITY") ||
                          (r.op == "ANTENNA") ||     // native antenna builds a private L2N
+                         (r.op == "ERC") ||         // native ERC builds a private L2N
                          (r.connectivity != SVRFConnectivity::none);
       if (main_thread) {
         exec_rule (r, slot);                         // inline, at source position
@@ -960,6 +962,7 @@ void SVRFEngine::execute_leveled (std::size_t n_noncopy,
                          dup_name ||
                          (r.op == "DENSITY") ||
                          (r.op == "ANTENNA") ||     // native antenna builds a private L2N
+                         (r.op == "ERC") ||         // native ERC builds a private L2N
                          (r.connectivity != SVRFConnectivity::none);
       if (main_thread) {
         exec_rule (r, slot);
@@ -2818,6 +2821,10 @@ void SVRFEngine::exec_rule (const SVRFRule &r, std::size_t slot)
     exec_property (r, slot);           // eqDRC (#8): equation-based per-shape check
     return;
   }
+  if (r.op == "ERC") {
+    exec_erc (r, slot);                // ERC (#13): native electrical-rule check
+    return;
+  }
 
   db::Coord d = to_dbu (r.value);
   db::EdgePairs ep;
@@ -3405,7 +3412,13 @@ void SVRFEngine::emit_rve_db () const
     if (! it->rule || it->verdict != "FAIL") continue;
     std::map<std::string, db::Region>::const_iterator ri = m_regions.find (it->rule->name);
     if (ri == m_regions.end ()) continue;
-    const std::string cat = xml_escape (it->rule->name);
+    //  The item's <category> is a category PATH, not a raw name: KLayout's rdb
+    //  reader splits it on "." (rdb::Categories::category_by_name). A foundry rule
+    //  name is DOTTED by convention (e.g. "M1.S.1"), so it must be emitted the way
+    //  KLayout's OWN rdb::Category::path() emits it -- quoted when it is not a bare
+    //  word over [A-Za-z0-9_$]. Without this, every dotted rule produced a .lyrdb
+    //  that KLayout itself refused to load ("... is not a valid category path").
+    const std::string cat = xml_escape (tl::to_word_or_quoted_string (it->rule->name, "_$"));
     for (db::Region::const_iterator p = ri->second.begin (); ! p.at_end (); ++p) {
       db::Polygon poly = *p;
       o << "  <item>\n";
@@ -3723,6 +3736,216 @@ void SVRFEngine::antenna_check (const SVRFRule &r, std::size_t slot)
 }
 
 // ---------------------------------------------------------------------------
+//  native ERC (fork feature #13)
+// ---------------------------------------------------------------------------
+//
+//  Electrical rule checks that are DERIVABLE FROM GEOMETRY + the deck's own
+//  CONNECT stack -- no schematic, no netlist input:
+//
+//    ERC FLOATING <layer> <tie>   a net that carries <layer> shapes but NEVER
+//                                 reaches a <tie> shape (floating gate / missing
+//                                 tie-down / undriven node).
+//    ERC UNCONNECTED <layer>      a net whose ONLY conductor is <layer> itself --
+//                                 an isolated island wired to nothing.
+//
+//  Both are solved on a PRIVATE db::LayoutToNetlist built from the CONNECT stack,
+//  so the shared m_l2n (and therefore every pre-existing rule's verdict) is never
+//  perturbed. The reported count is the number of offending NETS; the violation
+//  region is the offending <layer> geometry, so waivers and the RVE marker DB
+//  anchor to it exactly like any other rule.
+
+void SVRFEngine::connect_graph (std::set<std::string> &nodes,
+                                std::map<std::string, std::set<std::string> > &adj) const
+{
+  for (std::vector<std::tuple<std::string, std::string, std::string> >::const_iterator c = m_deck.connects.begin (); c != m_deck.connects.end (); ++c) {
+    const std::string &a = std::get<0> (*c), &b = std::get<1> (*c), &v = std::get<2> (*c);
+    nodes.insert (a); nodes.insert (b);
+    if (! v.empty ()) {
+      nodes.insert (v);
+      adj[a].insert (v); adj[v].insert (a);
+      adj[b].insert (v); adj[v].insert (b);
+    } else {
+      adj[a].insert (b); adj[b].insert (a);
+    }
+  }
+}
+
+std::string SVRFEngine::layer_base (const std::string &name, const std::set<std::string> &nodes) const
+{
+  if (nodes.count (name)) {
+    return name;
+  }
+  for (std::vector<SVRFDerivation>::const_iterator dv = m_deck.derivations.begin (); dv != m_deck.derivations.end (); ++dv) {
+    if (dv->name == name && (dv->kind == "bool" || dv->kind == "bool_expr")) {
+      for (std::vector<std::string>::const_iterator op = dv->operands.begin (); op != dv->operands.end (); ++op) {
+        if (nodes.count (*op)) {
+          return *op;
+        }
+      }
+      break;
+    }
+  }
+  return std::string ();
+}
+
+void SVRFEngine::exec_erc (const SVRFRule &r, std::size_t slot)
+{
+  auto skip = [&] (const std::string &why) {
+    SVRFResult res; res.rule = &r; res.verdict = "SKIP"; res.info = why;
+    m_results[slot] = res;
+  };
+  if (m_deck.connects.empty ()) {
+    skip ("ERC needs a CONNECT stack for connectivity");
+    return;
+  }
+
+  std::set<std::string> nodes;
+  std::map<std::string, std::set<std::string> > adj;
+  connect_graph (nodes, adj);
+
+  //  Every operand must be tie-able to the CONNECT stack, else there is no
+  //  electrical question to answer -> honest SKIP, never PASS.
+  const std::string base1 = layer_base (r.layer1, nodes);
+  if (base1.empty ()) {
+    skip ("ERC layer '" + r.layer1 + "' not resolvable to a CONNECT node");
+    return;
+  }
+  std::string base2;
+  if (! r.layer2.empty ()) {
+    base2 = layer_base (r.layer2, nodes);
+    if (base2.empty ()) {
+      skip ("ERC layer '" + r.layer2 + "' not resolvable to a CONNECT node");
+      return;
+    }
+  }
+
+  //  --- private L2N over the WHOLE CONNECT stack ---------------------------
+  //  Materialise EVERY operand region on the shared cache BEFORE any of them is
+  //  handed to the private L2N: db::LayoutToNetlist::register_layer() adopts the
+  //  region it is given, and a later resolve() of a derivation whose operands
+  //  were already adopted would evaluate to empty.
+  resolve (r.layer1);
+  if (! r.layer2.empty ()) { resolve (r.layer2); }
+  for (std::set<std::string>::const_iterator n = nodes.begin (); n != nodes.end (); ++n) {
+    resolve (*n);
+  }
+
+  db::LayoutToNetlist l2n ("TOP", m_dbu);
+  std::map<std::string, db::Region> reg;          // std::map: node pointers stay stable
+  auto get = [&] (const std::string &nm) -> db::Region & {
+    std::map<std::string, db::Region>::iterator it = reg.find (nm);
+    if (it != reg.end ()) return it->second;
+    reg[nm] = resolve (nm);                        // main-thread only (ERC never parallelised)
+    db::Region &ref = reg[nm];
+    l2n.register_layer (ref, nm);
+    l2n.connect (ref);                             // net-bearing (intra-layer)
+    return ref;
+  };
+  for (std::set<std::string>::const_iterator n = nodes.begin (); n != nodes.end (); ++n) {
+    get (*n);
+  }
+  for (std::vector<std::tuple<std::string, std::string, std::string> >::const_iterator c = m_deck.connects.begin (); c != m_deck.connects.end (); ++c) {
+    const std::string &a = std::get<0> (*c), &b = std::get<1> (*c), &v = std::get<2> (*c);
+    if (! v.empty ()) {
+      l2n.connect (get (a), get (v));
+      l2n.connect (get (b), get (v));
+    } else {
+      l2n.connect (get (a), get (b));
+    }
+  }
+  //  A derived marker (e.g. gate = poly AND active) is NOT a conductor: register
+  //  it as a probe layer riding its base node, so shapes_of_net can report it.
+  auto probe = [&] (const std::string &name, const std::string &base) -> db::Region & {
+    if (name == base) {
+      return get (name);                           // the layer IS a stack conductor
+    }
+    const std::string key = "__probe_" + name + "__";
+    std::map<std::string, db::Region>::iterator it = reg.find (key);
+    if (it != reg.end ()) return it->second;
+    reg[key] = resolve (name);
+    db::Region &ref = reg[key];
+    l2n.register_layer (ref, key);
+    l2n.connect (ref, get (base));                 // rides the base net; never bridges
+    return ref;
+  };
+  db::Region &p1 = probe (r.layer1, base1);
+  db::Region *p2 = 0;
+  if (! r.layer2.empty ()) {
+    p2 = &probe (r.layer2, base2);
+  }
+
+  try {
+    l2n.extract_netlist ();
+  } catch (tl::Exception &e) {
+    SVRFResult res; res.rule = &r; res.verdict = "ERROR";
+    std::string m = e.msg (); if (m.size () > 80) m = m.substr (0, 80);
+    res.info = m; m_results[slot] = res; return;
+  } catch (...) {
+    SVRFResult res; res.rule = &r; res.verdict = "ERROR";
+    res.info = "ERC extract error"; m_results[slot] = res; return;
+  }
+
+  //  --- per-net verdict ----------------------------------------------------
+  const bool dbg = getenv ("SVRFDRC_ERCNET") != 0;
+  const bool floating = (r.erc_check == "FLOATING");
+  db::Region viol;
+  std::size_t nviol = 0;
+  db::Netlist *nl = l2n.netlist ();
+  if (nl) {
+    for (db::Netlist::circuit_iterator ci = nl->begin_circuits (); ci != nl->end_circuits (); ++ci) {
+      for (db::Circuit::net_iterator net = ci->begin_nets (); net != ci->end_nets (); ++net) {
+        std::unique_ptr<db::Region> s1 (l2n.shapes_of_net (*net, p1, true));
+        if (! s1 || s1->empty ()) {
+          continue;                                // this net does not carry layer1
+        }
+        bool bad = false;
+        if (floating) {
+          std::unique_ptr<db::Region> s2 (l2n.shapes_of_net (*net, *p2, true));
+          bad = (! s2 || s2->empty ());            // never reaches the tie -> floating
+        } else {
+          //  UNCONNECTED: the net must carry NO conductor other than layer1's base.
+          bad = true;
+          for (std::set<std::string>::const_iterator n = nodes.begin (); n != nodes.end () && bad; ++n) {
+            if (*n == base1) continue;
+            std::unique_ptr<db::Region> so (l2n.shapes_of_net (*net, get (*n), true));
+            if (so && ! so->empty ()) {
+              bad = false;                         // some other conductor is on this net
+            }
+          }
+        }
+        if (dbg) {
+          fprintf (stderr, "ERCNET %s check=%s net=%s layer1_shapes=%zu -> %s\n",
+                   r.name.c_str (), r.erc_check.c_str (), net->expanded_name ().c_str (),
+                   (size_t) s1->count (), bad ? "VIOLATION" : "ok");
+        }
+        if (bad) {
+          ++nviol;
+          viol += *s1;                             // the offending geometry itself
+        }
+      }
+    }
+  }
+
+  //  waiver suppression applies to ERC violations too (geometry-anchored).
+  db::EdgePairs no_ep;
+  std::size_t waived = 0;
+  std::size_t before = viol.count ();
+  maybe_apply_waivers (r, no_ep, false, viol, waived);
+  if (waived > 0 && before > 0) {
+    //  a waived marker removes its net from the count (never inflates it)
+    std::size_t after = viol.count ();
+    std::size_t drop = (before - after);
+    nviol = (drop >= nviol) ? 0 : (nviol - drop);
+  }
+
+  m_regions[r.name] = viol;
+  SVRFResult res; res.rule = &r;
+  res.verdict = nviol == 0 ? "PASS" : "FAIL";
+  res.info = std::to_string (nviol);
+  m_results[slot] = res;
+}
+
+// ---------------------------------------------------------------------------
 //  report -- BYTE-IDENTICAL to run_svrf_drc.py::main()
 // ---------------------------------------------------------------------------
 
@@ -3781,6 +4004,17 @@ void SVRFEngine::write_report (const std::string &report_path, const std::string
     if (r.op == "PROPERTY") {
       out << vpad << " " << npad << " PROPERTY " << r.layer1 << " { " << r.prop_expr << " } "
           << r.cmp << " " << py_float_str (r.value) << " " << tag << " -> " << it->info << "\n";
+      continue;
+    }
+
+    //  ERC (#13) carries no cmp/value -- it states the error condition itself.
+    //  Only ERC rules take this branch, so no other op's line moves.
+    if (r.op == "ERC") {
+      out << vpad << " " << npad << " ERC " << r.erc_check << " " << r.layer1;
+      if (! r.layer2.empty ()) {
+        out << "/" << r.layer2;
+      }
+      out << " " << tag << " -> " << it->info << "\n";
       continue;
     }
 

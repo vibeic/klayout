@@ -70,6 +70,12 @@ struct SVRFRule
   //  violation when   eval(prop_expr) <cmp> value   is TRUE (Calibre convention:
   //  the rule states the ERROR condition). Empty for every other op.
   std::string prop_expr;
+  //  ERC (#13): native electrical-rule check. When op == "ERC", erc_check names
+  //  the sub-check -- "FLOATING" (layer1 shapes on a net that never reaches the
+  //  layer2 tie/driver) or "UNCONNECTED" (layer1 shapes on a net that carries no
+  //  other conductor at all -- an isolated island). cmp/value are unused; the
+  //  reported count is the number of offending NETS. Empty for every other op.
+  std::string erc_check;
   bool supported = true;
   std::string reason;
   std::string raw;
