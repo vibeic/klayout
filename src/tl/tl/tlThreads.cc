@@ -28,6 +28,7 @@
 #include "tlInternational.h"
 
 #include <map>
+#include <atomic>
 
 #if !defined(HAVE_QT) || defined(HAVE_PTHREADS)
 
@@ -239,7 +240,7 @@ class ThreadPrivateData
 {
 public:
   ThreadPrivateData ()
-    : pthread (), initialized (false), return_code (0), running (false)
+    : pthread (), initialized (false), return_code (0), running (false), joined (false)
   {
     //  .. nothing yet ..
   }
@@ -247,7 +248,14 @@ public:
   pthread_t pthread;
   bool initialized;
   void *return_code;
-  bool running;
+  //  `running` becomes false once the thread FUNCTION (run()) has returned, but
+  //  the OS thread is not necessarily reaped yet -- it is atomic because it is
+  //  written by the worker and read by the owner. `joined` records that
+  //  pthread_join has already reaped the OS thread, so wait() joins exactly once
+  //  and never uses `running` (a "work done" signal) as a "safe to destroy"
+  //  signal. See Thread::wait().
+  std::atomic<bool> running;
+  bool joined;
 };
 
 void *start_thread (void *data)
@@ -274,13 +282,13 @@ void Thread::do_run ()
 {
   try {
     run ();
-    mp_data->running = false;
+    mp_data->running.store (false, std::memory_order_release);
   } catch (tl::Exception &ex) {
     tl::error << tr ("Exception from thread : ") << ex.msg ();
-    mp_data->running = false;
+    mp_data->running.store (false, std::memory_order_release);
   } catch (...) {
     tl::error << tr ("Unspecific exception from thread");
-    mp_data->running = false;
+    mp_data->running.store (false, std::memory_order_release);
   }
 }
 
@@ -294,7 +302,7 @@ bool Thread::isFinished () const
   if (! mp_data->initialized) {
     return false;
   } else {
-    return ! mp_data->running;
+    return ! mp_data->running.load (std::memory_order_acquire);
   }
 }
 
@@ -303,7 +311,7 @@ bool Thread::isRunning () const
   if (! mp_data->initialized) {
     return false;
   } else {
-    return mp_data->running;
+    return mp_data->running.load (std::memory_order_acquire);
   }
 }
 
@@ -319,9 +327,12 @@ void Thread::start ()
   }
 
   mp_data->initialized = true;
-  mp_data->running = true;
+  mp_data->joined = false;
+  mp_data->running.store (true, std::memory_order_release);
   if (pthread_create (&mp_data->pthread, NULL, &start_thread, (void *) this) != 0) {
     tl::error << tr ("Failed to create thread");
+    mp_data->running.store (false, std::memory_order_release);
+    mp_data->initialized = false;
   }
 }
 
@@ -334,7 +345,19 @@ void Thread::terminate ()
 
 bool Thread::wait (unsigned long time)
 {
-  if (! isRunning ()) {
+  //  Nothing to wait for if the thread was never started (or failed to start),
+  //  or if it has already been joined once. IMPORTANT: we must NOT skip the join
+  //  on the basis of the `running` flag. do_run() clears `running` as soon as
+  //  run() RETURNS, but the OS thread is not reaped until pthread_join -- there
+  //  is a window in which run() is done, `running` is false, yet the thread is
+  //  still executing its exit path (stack unwind, thread-local destructors,
+  //  libc/pthread teardown). If wait() returned in that window the owner would
+  //  destroy this Thread (freeing its run-closure and mp_data) out from under a
+  //  live OS thread -> use-after-free / heap-metadata corruption, and the missed
+  //  join would also drop the happens-before barrier that publishes the worker's
+  //  heap writes to the joining thread. pthread_join is the only reliable "the
+  //  thread has truly exited" barrier, so wait() always performs it exactly once.
+  if (! mp_data->initialized || mp_data->joined) {
     return true;
   }
 
@@ -352,8 +375,10 @@ bool Thread::wait (unsigned long time)
 
 #if defined(_WIN32) || defined(__APPLE__)
 
-    //  wait if the thread terminated or the timeout has expired
-    while (isRunning ()) {
+    //  no pthread_timedjoin_np on these platforms: poll until run() has finished
+    //  or the timeout expires, then JOIN so the OS thread is actually reaped
+    //  before we return (returning without a join is the use-after-free above).
+    while (mp_data->running.load (std::memory_order_acquire)) {
 
       struct timespec current_time;
       current_utc_time (&current_time);
@@ -369,6 +394,11 @@ bool Thread::wait (unsigned long time)
 
     }
 
+    if (pthread_join (mp_data->pthread, &mp_data->return_code) != 0) {
+      tl::error << tr ("Could not join threads");
+    }
+    mp_data->joined = true;
+
 #else
 
     int res = pthread_timedjoin_np (mp_data->pthread, &mp_data->return_code, &end_time);
@@ -377,6 +407,7 @@ bool Thread::wait (unsigned long time)
     } else if (res) {
       tl::error << tr ("Could not join threads");
     }
+    mp_data->joined = true;
 
 #endif
 
@@ -387,6 +418,7 @@ bool Thread::wait (unsigned long time)
     if (pthread_join (mp_data->pthread, &mp_data->return_code) != 0) {
       tl::error << tr ("Could not join threads");
     }
+    mp_data->joined = true;
 
     return true;
 
