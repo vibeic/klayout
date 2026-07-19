@@ -1,0 +1,38 @@
+// densgrad.rule -- SYNTHETIC (NO vendor data). Exercises the CMP density-GRADIENT
+// check (fork feature #49): a foundry planarity/CMP rule caps not the density in a
+// window but how much density may CHANGE between edge-adjacent windows (a steep
+// density step dishes/erodes at CMP).
+//
+// Layer numbers are synthetic placeholders:  met1 4/0 (measured), frame 100/0
+// (a fixed extent-defining rectangle -- NOT measured -- so the WINDOW/STEP tiling
+// covers exactly [0,0..20,10] in every fixture).
+//
+//   DENSITY <layer> <cmp> <delta> WINDOW <w> STEP <s> GRADIENT
+//       tile the extent on the WINDOW/STEP grid, measure per-tile fill fraction,
+//       flag any edge-adjacent tile pair whose |density_i - density_j| <cmp> delta.
+//       (cmp/value lead, then the WINDOW/STEP/GRADIENT modifiers -- same statement
+//        shape as the built-in DENSITY: "DENSITY metal1 < 0.30 WINDOW 100 STEP 50".)
+//
+// DG.M1  : WINDOW 10 STEP 10 over the 20x10 extent -> exactly two tiles
+//          T0=[0,0..10,10] and T1=[10,0..20,10]. Flag when the density STEP across
+//          them exceeds 0.50. Hand-computed: a met1 fill of [0,0..10,H] gives
+//          density(T0)=H/10, density(T1)=0, so the gradient is exactly H/10.
+//              H=6.0   -> 0.60 > 0.50 -> FAIL
+//              H=5.0   -> 0.50 = 0.50 -> PASS (not above the limit)
+//              H=5.001 -> 0.5001 > 0.50 -> FAIL (one DBU inside)
+//
+// DG.M1.NOGRAD : the SAME grid as a PLAIN per-window DENSITY>0.50 (no GRADIENT).
+//          This is the distinguisher: on a UNIFORM 0.60 fill both tiles read 0.60
+//          so the plain rule FAILs while the GRADIENT rule PASSes (delta 0) --
+//          proving the two checks are genuinely different, not a relabelled density.
+
+LAYER met1   4 0
+LAYER frame 100 0
+
+DG.M1 {
+  DENSITY met1 > 0.50 WINDOW 10 STEP 10 GRADIENT
+}
+
+DG.M1.NOGRAD {
+  DENSITY met1 > 0.50 WINDOW 10 STEP 10
+}

@@ -379,6 +379,8 @@ const std::vector<SVRFResult> &SVRFEngine::execute ()
                          (r.op == "ANTENNA") ||     // native antenna builds a private L2N
                          (r.op == "ERC") ||         // native ERC builds a private L2N
                          (r.op == "VSPACE") ||      // voltage-aware spacing builds a private L2N
+                         (r.op == "MASK") ||        // MP colorability spans the whole layer
+                         (r.op == "CRITAREA") ||    // critical-area is pairwise over the layer
                          (r.connectivity != SVRFConnectivity::none);
       if (main_thread) {
         exec_rule (r, slot);                         // inline, at source position
@@ -965,6 +967,8 @@ void SVRFEngine::execute_leveled (std::size_t n_noncopy,
                          (r.op == "ANTENNA") ||     // native antenna builds a private L2N
                          (r.op == "ERC") ||         // native ERC builds a private L2N
                          (r.op == "VSPACE") ||      // voltage-aware spacing builds a private L2N
+                         (r.op == "MASK") ||        // MP colorability spans the whole layer
+                         (r.op == "CRITAREA") ||    // critical-area is pairwise over the layer
                          (r.connectivity != SVRFConnectivity::none);
       if (main_thread) {
         exec_rule (r, slot);
@@ -2253,6 +2257,286 @@ void SVRFEngine::exec_density (const SVRFRule &r, std::size_t slot)
 }
 
 // ---------------------------------------------------------------------------
+//  CMP density-gradient (#49): window-to-window density delta (planarity proxy)
+//
+//  Foundry CMP/planarity rules cap not just the density in a window but how much it
+//  can CHANGE between adjacent windows (a steep density step dishes/erodes at CMP).
+//  This tiles the layout extent on the same WINDOW/STEP grid as DENSITY, measures the
+//  per-tile fill fraction, and flags any edge-adjacent tile pair whose ABSOLUTE
+//  density difference satisfies the rule relation. The reported count is the number of
+//  merged violating-tile clusters (identical convention to plain DENSITY), and the
+//  marker is those tiles -- so the .lyrdb can never disagree with the verdict.
+// ---------------------------------------------------------------------------
+
+void SVRFEngine::exec_density_gradient (const SVRFRule &r, std::size_t slot)
+{
+  if (! r.has_window) {
+    SVRFResult res; res.rule = &r; res.verdict = "SKIP";
+    res.info = "density gradient needs a WINDOW";
+    m_results[slot] = res;
+    return;
+  }
+  db::Region reg = resolve (r.layer1);
+  if (! r.layer2.empty ()) {
+    reg = reg | resolve (r.layer2);
+  }
+  db::Box extent = m_layout.cell (m_top).bbox ();
+  if (extent.empty ()) {
+    SVRFResult res; res.rule = &r; res.verdict = "PASS"; res.info = "0";
+    m_results[slot] = res;
+    return;
+  }
+  double thr = r.value;
+  const std::string &cmp = r.cmp;
+  auto viol = [&] (double delta) -> bool {
+    if (cmp == "<")  return delta < thr;
+    if (cmp == "<=") return delta <= thr;
+    if (cmp == ">")  return delta > thr;
+    if (cmp == ">=") return delta >= thr;
+    if (cmp == "==") return delta == thr;
+    return false;
+  };
+
+  db::Coord W = to_dbu (r.window);
+  db::Coord s = r.has_step ? to_dbu (r.step) : W;
+  if (s <= 0) {
+    s = W;
+  }
+  if (W <= 0) {
+    SVRFResult res; res.rule = &r; res.verdict = "SKIP";
+    res.info = "density gradient WINDOW must be > 0";
+    m_results[slot] = res;
+    return;
+  }
+  //  same tile-count guard as exec_density (bound the grid regardless of extent).
+  while (((long long) (extent.width () / s) + 1) * ((long long) (extent.height () / s) + 1) > 20000) {
+    s *= 2;
+  }
+
+  //  measure per-tile density into a grid indexed by (ix,iy).
+  int nx = (int) ((extent.width ()  - 1) / s) + 1;
+  int ny = (int) ((extent.height () - 1) / s) + 1;
+  if (nx < 1) nx = 1;
+  if (ny < 1) ny = 1;
+  std::vector<double> dens ((std::size_t) nx * ny, 0.0);
+  std::vector<db::Box> tile ((std::size_t) nx * ny);
+  auto at = [&] (int ix, int iy) -> std::size_t { return (std::size_t) iy * nx + ix; };
+  for (int iy = 0; iy < ny; ++iy) {
+    for (int ix = 0; ix < nx; ++ix) {
+      db::Coord x = extent.left ()   + (db::Coord) ix * s;
+      db::Coord y = extent.bottom () + (db::Coord) iy * s;
+      db::Box w (x, y, x + W, y + W);
+      double area = (double) w.area ();
+      double d = area > 0 ? (double) (reg & db::Region (w)).area () / area : 0.0;
+      dens[at (ix, iy)] = d;
+      tile[at (ix, iy)] = w;
+    }
+  }
+
+  //  flag edge-adjacent tile pairs (right + up neighbour) over the delta limit.
+  db::Region bad;
+  for (int iy = 0; iy < ny; ++iy) {
+    for (int ix = 0; ix < nx; ++ix) {
+      double d = dens[at (ix, iy)];
+      if (ix + 1 < nx) {
+        double dn = dens[at (ix + 1, iy)];
+        if (viol (std::fabs (d - dn))) { bad.insert (tile[at (ix, iy)]); bad.insert (tile[at (ix + 1, iy)]); }
+      }
+      if (iy + 1 < ny) {
+        double dn = dens[at (ix, iy + 1)];
+        if (viol (std::fabs (d - dn))) { bad.insert (tile[at (ix, iy)]); bad.insert (tile[at (ix, iy + 1)]); }
+      }
+    }
+  }
+
+  //  merge the violating tiles into clusters (edge-abutting tiles union into one
+  //  region), so the reported count is the number of distinct violating clusters and
+  //  the .lyrdb marker matches -- the same convention as the plain DENSITY check.
+  bad.merge ();
+  size_t cnt = bad.count ();
+  m_regions[r.name] = bad;
+  SVRFResult res; res.rule = &r;
+  res.verdict = cnt == 0 ? "PASS" : "FAIL";
+  res.info = std::to_string (cnt);
+  m_results[slot] = res;
+}
+
+// ---------------------------------------------------------------------------
+//  Multi-patterning colorability (#25): same-mask 2-colouring / odd-cycle check
+//
+//  Build the same-mask CONFLICT graph -- one node per distinct polygon of layer1, an
+//  edge between two polygons whose spacing is LESS than the rule value (they cannot go
+//  on the same mask). The layer is decomposable into two masks iff this graph is
+//  2-colourable, i.e. bipartite. A component that carries an ODD conflict cycle is
+//  NOT 2-colourable -- the layout is undecomposable at this pitch. We report every
+//  shape in such a component and emit them as the marker. The colour ASSIGNMENT (which
+//  physical mask) is foundry-[EXT]; the DECOMPOSABILITY test is pure geometry + graph.
+// ---------------------------------------------------------------------------
+
+void SVRFEngine::exec_mask_coloring (const SVRFRule &r, std::size_t slot)
+{
+  db::Region reg = resolve (r.layer1);
+  //  one node per connected (merged) polygon.
+  std::vector<db::Polygon> polys;
+  for (db::Region::const_iterator p = reg.begin_merged (); ! p.at_end (); ++p) {
+    polys.push_back (*p);
+  }
+  const std::size_t n = polys.size ();
+  if (n < 2) {
+    //  0 or 1 shape: trivially colourable, but a PASS would be vacuous, so SKIP.
+    SVRFResult res; res.rule = &r; res.verdict = "SKIP";
+    res.info = "fewer than two shapes -- nothing to decompose";
+    m_results[slot] = res;
+    return;
+  }
+
+  db::Coord d = to_dbu (r.value);
+  std::vector<db::Box> bb (n);
+  for (std::size_t i = 0; i < n; ++i) {
+    bb[i] = polys[i].box ();
+  }
+
+  //  conflict adjacency: spacing < d  <=>  a separation_check at distance d is
+  //  non-empty (facing edges strictly closer than d). Exactly d is NOT a conflict --
+  //  the Calibre "space < value" convention -- so the boundary is decided to the DBU.
+  db::RegionCheckOptions o;                          // default: euclidian metric
+  std::vector<std::vector<std::size_t> > adj (n);
+  for (std::size_t i = 0; i < n; ++i) {
+    db::Region ri; ri.insert (polys[i]);
+    db::Box ei = bb[i].enlarged (db::Vector (d, d));
+    for (std::size_t j = i + 1; j < n; ++j) {
+      if (! ei.overlaps (bb[j])) {
+        continue;                                    // bbox gap >= d -> cannot conflict
+      }
+      db::Region rj; rj.insert (polys[j]);
+      if (ri.separation_check (rj, d, o).count () > 0) {
+        adj[i].push_back (j);
+        adj[j].push_back (i);
+      }
+    }
+  }
+
+  //  BFS 2-colouring; a component is bad if any edge joins two same-colour nodes.
+  std::vector<int> color (n, -1);
+  std::vector<char> bad_node (n, 0);
+  for (std::size_t src = 0; src < n; ++src) {
+    if (color[src] != -1) {
+      continue;
+    }
+    //  collect the component and 2-colour it.
+    std::vector<std::size_t> comp;
+    std::vector<std::size_t> stack;
+    stack.push_back (src);
+    color[src] = 0;
+    bool bipartite = true;
+    while (! stack.empty ()) {
+      std::size_t u = stack.back (); stack.pop_back ();
+      comp.push_back (u);
+      for (std::size_t k = 0; k < adj[u].size (); ++k) {
+        std::size_t v = adj[u][k];
+        if (color[v] == -1) {
+          color[v] = 1 - color[u];
+          stack.push_back (v);
+        } else if (color[v] == color[u]) {
+          bipartite = false;                         // an odd conflict cycle
+        }
+      }
+    }
+    if (! bipartite) {
+      for (std::size_t k = 0; k < comp.size (); ++k) {
+        bad_node[comp[k]] = 1;                       // whole undecomposable component
+      }
+    }
+  }
+
+  db::Region viol;
+  for (std::size_t i = 0; i < n; ++i) {
+    if (bad_node[i]) {
+      viol.insert (polys[i]);
+    }
+  }
+  std::size_t cnt = viol.count ();
+  m_regions[r.name] = viol;
+  SVRFResult res; res.rule = &r;
+  res.verdict = cnt == 0 ? "PASS" : "FAIL";
+  res.info = std::to_string (cnt);
+  m_results[slot] = res;
+}
+
+// ---------------------------------------------------------------------------
+//  Critical-area analysis (#46): shorts critical area at a probe defect radius
+//
+//  A circular particle defect of radius rho shorts two conductors iff its centre lies
+//  within rho of BOTH -- i.e. inside (P_i (+)rho) INTERSECT (P_j (+)rho). The SHORTS
+//  critical area at a single probe radius is the union of that locus over every
+//  distinct conductor pair (um^2). KLayout's default (mode-2) sizing grows an
+//  orthogonal shape to an exact rectangle, so for two parallel rails of length L,
+//  spacing s, this reduces to the closed form (2*rho - s) * (L + 2*rho) -- hand-
+//  checkable to the DBU. The defect-DENSITY weighting that turns this into a yield
+//  number is foundry-[EXT] and stays a caller multiplier; here we ship the geometry
+//  engine and gate the area itself.
+// ---------------------------------------------------------------------------
+
+void SVRFEngine::exec_critical_area (const SVRFRule &r, std::size_t slot)
+{
+  if (! r.has_radius || r.radius <= 0.0) {
+    SVRFResult res; res.rule = &r; res.verdict = "SKIP";
+    res.info = "critical area needs a positive RADIUS";
+    m_results[slot] = res;
+    return;
+  }
+  db::Region reg = resolve (r.layer1);
+  std::vector<db::Polygon> polys;
+  for (db::Region::const_iterator p = reg.begin_merged (); ! p.at_end (); ++p) {
+    polys.push_back (*p);
+  }
+  const std::size_t n = polys.size ();
+  db::Coord rho = to_dbu (r.radius);
+
+  //  grow each conductor once, then union the pairwise overlaps (defect-centre loci).
+  std::vector<db::Region> grown (n);
+  std::vector<db::Box> gbb (n);
+  for (std::size_t i = 0; i < n; ++i) {
+    db::Region ri; ri.insert (polys[i]);
+    grown[i] = ri.sized (rho);                       // mode 2 -> exact rectangle on Manhattan geom
+    gbb[i] = grown[i].bbox ();
+  }
+  db::Region ca;
+  for (std::size_t i = 0; i < n; ++i) {
+    for (std::size_t j = i + 1; j < n; ++j) {
+      if (! gbb[i].overlaps (gbb[j])) {
+        continue;                                    // grown bboxes disjoint -> no bridge
+      }
+      db::Region inter = grown[i] & grown[j];
+      if (! inter.empty ()) {
+        ca += inter;
+      }
+    }
+  }
+
+  double area_um2 = (double) ca.area () * m_dbu * m_dbu;
+  bool bad = false;
+  if      (r.cmp == "<")  bad = (area_um2 <  r.value);
+  else if (r.cmp == "<=") bad = (area_um2 <= r.value);
+  else if (r.cmp == ">")  bad = (area_um2 >  r.value);
+  else if (r.cmp == ">=") bad = (area_um2 >= r.value);
+  else if (r.cmp == "==") bad = (area_um2 == r.value);
+
+  if (getenv ("SVRFDRC_CAAVAL")) {
+    fprintf (stderr, "CAAVAL %s radius=%.6f area=%.6f cmp %s thr=%.6f -> %s\n",
+             r.name.c_str (), r.radius, area_um2, r.cmp.c_str (), r.value, bad ? "FAIL" : "ok");
+  }
+
+  m_regions[r.name] = bad ? ca : db::Region ();      // marker only when the rule fires
+  SVRFResult res; res.rule = &r;
+  res.verdict = bad ? "FAIL" : "PASS";
+  //  report the offending locus polygon count on FAIL (matches the .lyrdb item count),
+  //  0 on PASS.
+  res.info = bad ? std::to_string (ca.count ()) : std::string ("0");
+  m_results[slot] = res;
+}
+
+// ---------------------------------------------------------------------------
 //  Route B, Phase 1: spatial tiling of finite-reach EXTERNAL (space/separation)
 //
 //  Studied from KLayout's OWN tiled DRC (src/drc/.../_drc_engine.rb::_tcmd +
@@ -2812,7 +3096,19 @@ void SVRFEngine::exec_rule (const SVRFRule &r, std::size_t slot)
     return;
   }
   if (r.op == "DENSITY") {
-    exec_density (r, slot);
+    if (r.gradient) {
+      exec_density_gradient (r, slot); // #49: window-to-window density delta (planarity)
+    } else {
+      exec_density (r, slot);
+    }
+    return;
+  }
+  if (r.op == "MASK") {
+    exec_mask_coloring (r, slot);      // #25: multi-patterning 2-colorability
+    return;
+  }
+  if (r.op == "CRITAREA") {
+    exec_critical_area (r, slot);      // #46: shorts critical-area analysis
     return;
   }
   if (r.op == "ANTENNA") {

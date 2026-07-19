@@ -1,0 +1,24 @@
+// mask.rule -- SYNTHETIC (NO vendor data). Exercises multi-patterning colorability
+// (fork feature #25): two DISTINCT polygons closer than the same-mask spacing form a
+// CONFLICT edge; the layer decomposes into two masks iff its conflict graph is
+// 2-colourable (bipartite). A component carrying an ODD conflict cycle is NOT
+// 2-colourable -- the pitch is undecomposable -- and every shape in it is reported.
+//
+// Layer numbers are synthetic placeholders:  mp 40/0.
+//
+//   MASK <layer> SPACING <d>
+//       conflict(i,j) iff spacing(i,j) < d (strictly; exactly d is legal, so the
+//       boundary is decided to the DBU). Reported count = shapes in a non-2-colourable
+//       component. The mask COLOUR assignment is foundry-[EXT]; the DECOMPOSABILITY
+//       test (is an odd cycle present at this pitch) is pure geometry + graph.
+//
+// The gate proves this is REAL 2-colouring, not "any near pair fails":
+//   - a TRIANGLE of three mutually-conflicting shapes (odd cycle) -> FAIL 3
+//   - a 4-CYCLE ring of four shapes (even cycle) whose diagonals are > d apart
+//     -> 2-colourable -> PASS 0, even though every ring edge is a conflict.
+
+LAYER mp 40 0
+
+MP.DECOMP {
+  MASK mp SPACING 0.30
+}

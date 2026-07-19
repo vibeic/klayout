@@ -83,6 +83,21 @@ struct SVRFRule
   //  a voltage-aware rule with no voltage term is just EXTERNAL.
   bool has_per_volt = false;
   double per_volt = 0.0;
+  //  CMP density-gradient (#49). When op == "DENSITY" and gradient is set, the rule
+  //  measures the ABSOLUTE density DIFFERENCE between edge-adjacent windows on the
+  //  WINDOW/STEP grid (planarity / dishing proxy) instead of the per-window density
+  //  itself; a window pair is a violation when |dens_i - dens_j| <cmp> value. Without
+  //  GRADIENT the DENSITY rule keeps its per-window meaning. window/step are shared
+  //  with the plain DENSITY parse.
+  bool gradient = false;
+  //  Critical-area analysis (#46). When op == "CRITAREA", the rule measures the
+  //  SHORTS critical area at a single probe defect radius: over the distinct merged
+  //  polygons P_i of layer1, the area of the union of (P_i sized +radius) INTERSECT
+  //  (P_j sized +radius) for i<j (um^2) -- the locus of defect centres that bridge
+  //  two conductors. cmp/value gate the measured area; the marker is that locus. The
+  //  defect-density weighting (the yield number) is [EXT] and stays a caller multiplier.
+  bool has_radius = false;
+  double radius = 0.0;
   bool supported = true;
   std::string reason;
   std::string raw;

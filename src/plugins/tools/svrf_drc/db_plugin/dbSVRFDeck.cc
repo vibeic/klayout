@@ -480,6 +480,73 @@ static SVRFRule make_erc_rule (const std::string &name, const std::smatch &m)
   return r;
 }
 
+//  Multi-patterning colorability (#25) recognizer. Groups: 1=layer 2=spacing.
+//    MASK <layer> [SPACING|SPACE|SEP] <d>
+//  Two DISTINCT polygons on <layer> closer than <d> form a same-mask CONFLICT edge;
+//  the layer is decomposable iff its conflict graph is 2-colorable (bipartite). The
+//  op states no relation -- the reported count is the number of shapes that lie in a
+//  NON-2-colourable (odd-cycle-carrying) component. Anchored to end-of-string like the
+//  other whole-statement recognizers. The mask-ASSIGNMENT (which colour) is [EXT]; the
+//  DECOMPOSABILITY (is an odd cycle present at this pitch) is pure geometry + graph.
+static const std::regex &mask_re ()
+{
+  static const std::regex re (
+    R"(\bMASK\b\s+([A-Za-z_][\w.$]*)\s+(?:SPACING|SPACE|SEP)\s+([0-9]*\.?[0-9]+)\s*$)",
+    std::regex::ECMAScript | std::regex::icase);
+  return re;
+}
+
+static SVRFRule make_mask_rule (const std::string &name, const std::smatch &m)
+{
+  SVRFRule r;
+  r.name = name;
+  r.op = "MASK";
+  r.layer1 = m[1].str ();
+  r.value = std::stod (m[2].str ());          // same-mask minimum spacing (conflict < d)
+  r.cmp = std::string ();                      // the op states the error condition itself
+  {
+    std::string full = m[0].str ();
+    size_t a = full.find_first_not_of (" \t\r\n\f\v");
+    size_t b = full.find_last_not_of (" \t\r\n\f\v");
+    r.raw = (a == std::string::npos) ? std::string () : full.substr (a, b - a + 1);
+  }
+  r.supported = true;
+  return r;
+}
+
+//  Critical-area analysis (#46) recognizer. Groups: 1=layer 2=radius 3=cmp 4=value.
+//    CRITAREA <layer> RADIUS <r> <cmp> <value>
+//  Measures the shorts critical area (um^2) at probe defect radius <r> and flags it
+//  against <value>. Anchored to end-of-string. RADIUS keyword is mandatory (no radius
+//  -> honest SKIP: a critical area with no defect size is undefined).
+static const std::regex &caa_re ()
+{
+  static const std::regex re (
+    R"(\bCRITAREA\b\s+([A-Za-z_][\w.$]*)\s+RADIUS\s+([0-9]*\.?[0-9]+)\s+(<=|<|==|>=|>)\s*([0-9]*\.?[0-9]+)\s*$)",
+    std::regex::ECMAScript | std::regex::icase);
+  return re;
+}
+
+static SVRFRule make_critarea_rule (const std::string &name, const std::smatch &m)
+{
+  SVRFRule r;
+  r.name = name;
+  r.op = "CRITAREA";
+  r.layer1 = m[1].str ();
+  r.has_radius = true;
+  r.radius = std::stod (m[2].str ());
+  r.cmp = m[3].str ();
+  r.value = std::stod (m[4].str ());
+  {
+    std::string full = m[0].str ();
+    size_t a = full.find_first_not_of (" \t\r\n\f\v");
+    size_t b = full.find_last_not_of (" \t\r\n\f\v");
+    r.raw = (a == std::string::npos) ? std::string () : full.substr (a, b - a + 1);
+  }
+  r.supported = true;
+  return r;
+}
+
 static void parse_modifiers (SVRFRule &rule, const std::string &tail)
 {
   static const std::regex re_proj (
@@ -599,6 +666,13 @@ static SVRFRule make_rule (const std::string &name, const std::smatch &meas)
       //  step defaults to window
       r.has_step = r.has_window;
       r.step = r.window;
+    }
+    //  CMP density-gradient (#49): the GRADIENT modifier switches the DENSITY rule
+    //  from "per-window density <cmp> value" to "|density_i - density_j| <cmp> value
+    //  between edge-adjacent windows". Same WINDOW/STEP grid.
+    static const std::regex re_grad (R"(\bGRADIENT\b)", std::regex::ECMAScript | std::regex::icase);
+    if (std::regex_search (tail, re_grad)) {
+      r.gradient = true;
     }
   } else if (op == "ANTENNA") {
     //  Native in-engine antenna (fork feature #20). The two-layer form
@@ -1153,6 +1227,8 @@ SVRFDeck parse_deck (const std::string &text)
         std::smatch pm;
         std::smatch cp;
         std::smatch em;
+        std::smatch mm2;
+        std::smatch cm;
         if (std::regex_search (joined, em, erc_re ())) {
           //  ERC (#13): ERC <check> <layer> [<layer2>]
           SVRFRule r = make_erc_rule (name, em);
@@ -1162,6 +1238,18 @@ SVRFDeck parse_deck (const std::string &text)
         } else if (std::regex_search (joined, pm, prop_re ())) {
           //  eqDRC (#8): PROPERTY <layer> <expr> <cmp> <value>
           SVRFRule r = make_property_rule (name, pm);
+          size_t idx = deck.rules.size ();
+          deck.rules.push_back (r);
+          deck.statements.push_back ({SVRFStatement::Rule, idx});
+        } else if (std::regex_search (joined, mm2, mask_re ())) {
+          //  MP colorability (#25): MASK <layer> SPACING <d>
+          SVRFRule r = make_mask_rule (name, mm2);
+          size_t idx = deck.rules.size ();
+          deck.rules.push_back (r);
+          deck.statements.push_back ({SVRFStatement::Rule, idx});
+        } else if (std::regex_search (joined, cm, caa_re ())) {
+          //  Critical-area (#46): CRITAREA <layer> RADIUS <r> <cmp> <value>
+          SVRFRule r = make_critarea_rule (name, cm);
           size_t idx = deck.rules.size ();
           deck.rules.push_back (r);
           deck.statements.push_back ({SVRFStatement::Rule, idx});
@@ -1201,6 +1289,8 @@ SVRFDeck parse_deck (const std::string &text)
       std::smatch mm;
       std::smatch pm;
       std::smatch em;
+      std::smatch km;
+      std::smatch cm;
       if (std::regex_search (rhs_stripped, mm, meas_re (), std::regex_constants::match_continuous)) {
         SVRFRule r = make_rule (ah[1].str (), mm);
         size_t idx = deck.rules.size ();
@@ -1215,6 +1305,18 @@ SVRFDeck parse_deck (const std::string &text)
       } else if (std::regex_search (rhs_stripped, pm, prop_re (), std::regex_constants::match_continuous)) {
         //  eqDRC (#8) assignment form:  NAME = PROPERTY <layer> <expr> <cmp> <value>
         SVRFRule r = make_property_rule (ah[1].str (), pm);
+        size_t idx = deck.rules.size ();
+        deck.rules.push_back (r);
+        deck.statements.push_back ({SVRFStatement::Rule, idx});
+      } else if (std::regex_search (rhs_stripped, km, mask_re (), std::regex_constants::match_continuous)) {
+        //  MP colorability (#25) assignment form:  NAME = MASK <layer> SPACING <d>
+        SVRFRule r = make_mask_rule (ah[1].str (), km);
+        size_t idx = deck.rules.size ();
+        deck.rules.push_back (r);
+        deck.statements.push_back ({SVRFStatement::Rule, idx});
+      } else if (std::regex_search (rhs_stripped, cm, caa_re (), std::regex_constants::match_continuous)) {
+        //  Critical-area (#46) assignment form:  NAME = CRITAREA <layer> RADIUS <r> <cmp> <value>
+        SVRFRule r = make_critarea_rule (ah[1].str (), cm);
         size_t idx = deck.rules.size ();
         deck.rules.push_back (r);
         deck.statements.push_back ({SVRFStatement::Rule, idx});

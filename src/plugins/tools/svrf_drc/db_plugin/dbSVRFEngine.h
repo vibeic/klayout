@@ -271,6 +271,25 @@ private:
   void exec_property (const SVRFRule &r, std::size_t slot);
   static double eval_prop_expr (const std::string &expr, double area, double perim,
                                 double w, double h, bool &ok);
+
+  //  CMP density-gradient (#49): the difference in metal density between edge-adjacent
+  //  WINDOW/STEP tiles (planarity / dishing proxy). exec_density_gradient tiles the
+  //  layout extent, measures per-tile density, and flags a tile pair whose absolute
+  //  density difference satisfies the rule relation. No net/L2N state -> reentrant, but
+  //  scheduled serially (unbounded window reach, like plain DENSITY).
+  void exec_density_gradient (const SVRFRule &r, std::size_t slot);
+
+  //  Multi-patterning colorability (#25): build the same-mask conflict graph (an edge
+  //  between two distinct polygons closer than the rule spacing) and report the shapes
+  //  in any component that is NOT 2-colourable (an odd conflict cycle -> the pitch is
+  //  undecomposable into 2 masks). Pure geometry + graph; the colour ASSIGNMENT is [EXT].
+  void exec_mask_coloring (const SVRFRule &r, std::size_t slot);
+
+  //  Critical-area analysis (#46): the shorts critical area at a probe defect radius --
+  //  the locus of defect centres that bridge two distinct conductors, = union over i<j
+  //  of (P_i sized +r) INTERSECT (P_j sized +r). exec_critical_area measures it (um^2)
+  //  and gates it against the rule value; the marker is that locus. Serial (pairwise reach).
+  void exec_critical_area (const SVRFRule &r, std::size_t slot);
   db::RegionCheckOptions check_options (const SVRFRule &r, bool allow_filters = true) const;
   db::EdgesCheckOptions  edge_check_options (const SVRFRule &r) const;
   bool inputs_unmodeled (const SVRFRule &r) const;
