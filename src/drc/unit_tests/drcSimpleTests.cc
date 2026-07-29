@@ -2113,3 +2113,33 @@ TEST(148_sparse_array_limit)
   run_test (_this, "148", true);
 }
 
+//  issue 2384
+TEST(149_compound_drc_with_mag)
+{
+  run_test (_this, "149", false);
+}
+
+TEST(149d_compound_drc_with_mag)
+{
+  run_test (_this, "149", true);
+}
+
+TEST(150_optimized_separation)
+{
+  run_test (_this, "150", false);
+}
+
+TEST(150d_optimized_separation)
+{
+  run_test (_this, "150", true);
+}
+
+TEST(151_edges_from_region_with_properties)
+{
+  run_test (_this, "151", false);
+}
+
+TEST(151d_edges_from_region_with_properties)
+{
+  run_test (_this, "151", true);
+}
