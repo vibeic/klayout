@@ -3471,3 +3471,61 @@ TEST(min_coherence_and_merge)
   EXPECT_EQ (r2.is_merged (), true);
   EXPECT_EQ (r2.to_string (), "(0,0;0,2000;1000,2000;1000,3000;9000,3000;9000,10000;10000,10000;10000,2000;1000,2000;1000,0)");
 }
+
+//  Two-layer checks must never see the artificial cut lines the DeepShapeStore
+//  introduces when it reduces polygon complexity (max_vertex_count/max_area_ratio).
+//  Such a cut line is interior to the original polygon, so a distance measured to
+//  it is always SMALLER than the true one - i.e. it produces false errors.
+//
+//  The polygon below has 18 vertices and is split by the default max_vertex_count
+//  of 16 into two pieces meeting on y=1310. The via at (1065,1085;1215,1235) sits
+//  entirely in the lower piece, 75 dbu below that cut, while the real metal
+//  boundary above it is at y=1515, i.e. 280 dbu away. Before the fix, the deep
+//  implementation reported the cut as an enclosure error against an 85 dbu limit.
+TEST(deep_two_layer_check_ignores_reduction_split_lines)
+{
+  db::Layout ly;
+  ly.dbu (0.001);
+
+  db::Cell &top_cell = ly.cell (ly.add_cell ("TOP"));
+  unsigned int l1 = ly.insert_layer (db::LayerProperties (1, 0));
+  unsigned int l2 = ly.insert_layer (db::LayerProperties (2, 0));
+
+  static const int coords [] = {
+    1010, 1000, 1010, 1145, 1000, 1145, 1000, 1515, 1280, 1515, 1280, 1400,
+    1990, 1400, 1990, 1540, 2105, 1540, 2105, 1630, 2365, 1630, 2365, 1310,
+    2130, 1310, 2130, 1260, 1280, 1260, 1280, 1145, 1270, 1145, 1270, 1000
+  };
+
+  std::vector<db::Point> pts;
+  for (size_t i = 0; i < sizeof (coords) / sizeof (coords [0]); i += 2) {
+    pts.push_back (db::Point (coords [i], coords [i + 1]));
+  }
+
+  db::Polygon poly;
+  poly.assign_hull (pts.begin (), pts.end ());
+  top_cell.shapes (l1).insert (poly);
+
+  top_cell.shapes (l2).insert (db::Box (1065, 1085, 1215, 1235));
+  top_cell.shapes (l2).insert (db::Box (2160, 1395, 2310, 1545));
+
+  db::RegionCheckOptions opt (false, db::Projection);
+
+  //  flat reference
+  db::Region flat_prim (db::RecursiveShapeIterator (ly, top_cell, l1));
+  db::Region flat_sec (db::RecursiveShapeIterator (ly, top_cell, l2));
+  std::string flat_res = db::EdgePairs (flat_prim.enclosing_check (flat_sec, 85, opt)).to_string ();
+
+  //  deep, with the default reduction settings - the polygon IS split
+  db::DeepShapeStore dss;
+  dss.set_threads (0);
+  db::Region deep_prim (db::RecursiveShapeIterator (ly, top_cell, l1), dss);
+  db::Region deep_sec (db::RecursiveShapeIterator (ly, top_cell, l2), dss);
+  db::EdgePairs deep_ep (deep_prim.enclosing_check (deep_sec, 85, opt));
+
+  //  the deep result must agree with the flat one
+  EXPECT_EQ (db::compare (deep_ep, flat_res), true);
+
+  //  and it must not contain the split line y=1310 as a subject edge
+  EXPECT_EQ (deep_ep.to_string ().find ("1310;1215,1310") == std::string::npos, true);
+}

@@ -889,9 +889,18 @@ check_local_operation<TS, TI>::override_distance () const
 {
   //  makes sure, the "foreign"-type pseudo-intruder used for merging only
   //  does not use the full search range, but only "touching".
+  //  NOTE: in box_scanner terms an enlargement of 1 - not 0 - is "touching"
+  //  (see dbBoxScanner.h: "An enlargement of 1 means that boxes have to touch
+  //  only in order to get an interaction"). With 0 the boxes had to overlap,
+  //  so two fragments of a single polygon split by the DeepShapeStore's
+  //  complexity reduction (max_vertex_count/max_area_ratio) - which share
+  //  exactly an edge and whose boxes therefore only touch - were never seen
+  //  as primary intruders. The subject merging this section exists for then
+  //  did not happen and the artificial split line was reported as a real
+  //  polygon boundary by the two-layer checks.
   std::map<unsigned int, db::Coord> od;
   if (check_local_operation_base<TS, TI>::m_has_other) {
-    od.insert (std::make_pair (1, 0));
+    od.insert (std::make_pair (1, 1));
   }
   return od;
 }
