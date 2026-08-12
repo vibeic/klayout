@@ -1,0 +1,16 @@
+{
+  "_comment": "Fork directories that are VENDORED VERBATIM into the vibe-ic plugin. Each plugin copy carries a PROVENANCE.md naming the fork commit it was taken from; `vendored_sync_check.py` asserts that claim is TRUE (bytes equal, and equal to the fork content AT the named commit). Only list directories whose plugin copy claims to be verbatim -- the reference wrappers in plugin-wiring/ are handed to the Core agent to OWN and evolve, so they are deliberately NOT listed here.",
+  "vendored_dirs": [
+    {
+      "fork_dir": "gds-antenna",
+      "plugin_dir": "gds_antenna",
+      "role": "staged-connectivity antenna DRC on the streamed GDS"
+    },
+    {
+      "fork_dir": "metal-fill",
+      "plugin_dir": "metal_fill",
+      "role": "per-layer density dummy-metal fill at streamout"
+    }
+  ],
+  "ignore": ["PROVENANCE.md", ".gitignore", "__pycache__", "*.pyc", "*.pyo"]
+}

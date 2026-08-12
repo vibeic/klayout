@@ -16,6 +16,67 @@ Core to land with a proper version bump.
 Both mirror the plugin's gate conventions: `main(argv) -> int`, JSON output, §4.05
 honest-skip (rc 3) when no KLayout binary / tool is present — never a vacuous PASS.
 
+Those two wrappers are handed over for Core to **own and evolve** — once landed, the
+plugin's copy is the live one and this fork copy is a historical reference. That is the
+opposite of the vendored *engines* below, which must stay verbatim.
+
+## Vendored engines — the plugin copies must BE what they claim
+
+The plugin also vendors the engine directories themselves, so a clean install reaches
+the capability with no container re-image. Each vendored copy carries a `PROVENANCE.md`:
+
+```
+* upstream: `vibeic/klayout` — `metal-fill/`
+* upstream commit: <sha>
+```
+
+That is a **falsifiable claim**, and for three commits nothing falsified it:
+`metal-fill/metal_fill.py` sat behind its own vendored copy while both `PROVENANCE.md`
+files still named the commit at which the two had last been equal. The fork therefore
+shipped an engine that **silently ignored a per-layer `fill_datatype`** — dropping dummy
+fill onto the signal-metal layer, reporting `fill_datatype: 0` and `verdict: PASS` — for
+as long as nobody diffed the two trees by hand. A provenance claim that is false is worse
+than no claim, because it is the thing people read *instead of* diffing.
+
+`vendored_sync_check.py` asserts both halves of the claim:
+
+| | assertion |
+|---|---|
+| **A. content** | every vendored file is byte-identical to its fork counterpart |
+| **B. provenance** | the commit named in `PROVENANCE.md` exists **and** the fork content *at that commit* is what was vendored |
+
+(B) is what catches what (A) cannot: a copy re-vendored from a newer fork state without
+refreshing the line. When (A) is green and (B) is red the fix is mechanical, and the
+program prints the exact line to write.
+
+```bash
+# from the fork root
+python3 plugin-wiring/vendored_sync_check.py \
+    --plugin-programs ~/vibe-ic/vibe-ic-marketplace/plugins/vibe-ic/programs
+#  rc 0 PASS · 1 FAIL · 2 usage/IO · 3 HONEST-SKIP (no plugin checkout — never a pass)
+```
+
+`VENDORED.json` lists the directories under the verbatim claim. **Add a directory here
+the moment the plugin starts vendoring it**, otherwise it is unguarded — the check can
+only police what it is told about.
+
+### When you change a vendored engine
+
+1. change it **in the fork** (never in place in the plugin — that is exactly how this
+   divergence started) and land it;
+2. re-vendor: copy the fork files over the plugin copy;
+3. refresh `upstream commit:` in that copy's `PROVENANCE.md` to the sha
+   `vendored_sync_check.py` prints;
+4. re-run the check — it must be `PASS`.
+
+Steps 2–4 are the Core agent's (only Core changes the plugin), so a fork-side change to a
+vendored engine is not finished when it lands in the fork: it is finished when the plugin
+copy and its provenance line follow. Until then the check is honestly red.
+
+`tests/run_vendored_sync_test.sh` is the gate for the checker itself — hermetic
+(throw-away git repo in `$TMPDIR`, no KLayout, no real plugin checkout), and it proves
+all three verdicts plus the honest-skip, so a green run means the checker can still fail.
+
 ## Tool discovery (how the plugin finds the fork engines)
 
 Both wrappers resolve the engine via, in order:
