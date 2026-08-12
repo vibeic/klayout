@@ -78,3 +78,7 @@ py.typed
 .tmp*
 .venv
 
+
+# vibeic fork regression suites (see vibeic-tests/run_all.sh)
+/bld-noqt/
+/vibeic-tests/logs/

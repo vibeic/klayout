@@ -1,0 +1,94 @@
+---
+# vibeic-tests -- run the regression harnesses this fork adds.
+#
+# `build.yml` builds Python wheels and executes no test. The repo-root `make test`
+# is macOS-only. So the 25 FAIL->PASS gates this fork carries for SVRF-native DRC,
+# in-engine ANTENNA, metal fill, CAA, multi-patterning colouring, PERC latch-up,
+# pattern match, LVS recon, CMP gradient and the plugin-vendoring sync check were
+# reachable from no build system at all.
+#
+# This workflow invokes `vibeic-tests/run_all.sh`, which invokes each harness BY
+# NAME and reports PASS / FAIL / named-SKIP. It never converts a red suite into a
+# green one: `run_all.sh` exits 1 if any suite fails, and this job fails with it.
+#
+# Two jobs on purpose:
+#   fast   -- no build, no container. Proves the wiring itself and runs every
+#             harness that needs nothing (the suite-list drift check and the
+#             hermetic vendoring gate). Minutes.
+#   full   -- builds KLayout `-without-qt` (the C++ gates link against
+#             `tl::Thread`, which a Qt build does not export) and pulls the
+#             published EDA image the pya-driven harnesses use. Tens of minutes,
+#             so it is not on every PR.
+name: vibeic regression suites
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: suites that need no build and no container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: make vibeic-test-list
+        run: make vibeic-test-list
+      - name: make vibeic-test
+        # Suites needing the KLayout build or the EDA container report a NAMED
+        # skip here and are covered by the `full` job below.
+        run: make vibeic-test
+
+  full:
+    name: every suite (KLayout -without-qt build + EDA container)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: vibeic-tests-noqt
+          max-size: "2G"
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential python3-dev zlib1g-dev libexpat1-dev \
+            libcurl4-openssl-dev libpng-dev qt6-base-dev
+      - name: make vibeic-test-build
+        run: |
+          export PATH="/usr/lib/ccache:$PATH"
+          make vibeic-test-build
+      - name: Pull the EDA image the pya-driven harnesses use
+        id: image
+        continue-on-error: true
+        run: docker pull "${EDA_IMAGE:-ghcr.io/vibeic/vibeic-eda:latest}"
+        env:
+          EDA_IMAGE: ${{ vars.EDA_IMAGE }}
+      - name: make vibeic-test
+        # If the image could not be pulled the container-driven suites report a
+        # NAMED skip; they are never silently counted as passes.
+        env:
+          EDA_IMAGE: ${{ vars.EDA_IMAGE }}
+        run: make vibeic-test
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: vibeic-test-logs
+          path: vibeic-tests/logs/

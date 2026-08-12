@@ -1,4 +1,4 @@
-.PHONY: help build deploy test dropbox-deploy
+.PHONY: help build deploy test dropbox-deploy vibeic-test vibeic-test-build vibeic-test-list
 
 GITCOMMIT := $(shell git rev-parse --short HEAD)
 KLAYOUT_VERSION := $(shell source version.sh && echo $$KLAYOUT_VERSION)
@@ -20,6 +20,32 @@ help:
 	@echo "make test MACOS_VERSION=HighSierra"
 	@echo "Valid Mac OS Versions: [Yosemite, ElCapitan, Sierra, HighSierra, Mojave, Catalina]"
 	@echo "Valid Python Version: [nil, Sys, HB38]"
+	@echo ""
+	@echo "Portable (this fork's own regression suites, Linux/macOS):"
+	@echo "make vibeic-test          run every harness under */tests/run_*.sh"
+	@echo "make vibeic-test-build    build the -without-qt KLayout the C++ gates link against"
+	@echo "make vibeic-test-list     print the suite list"
+
+# ---------------------------------------------------------------------------
+# THIS FORK'S OWN REGRESSION SUITES.
+#
+# `make test` above is macOS-only (build4mac.py, an .app bundle path, and
+# `ut_runner -h || true`), and `.github/workflows/build.yml` builds wheels and
+# runs no test. The 25 FAIL->PASS harnesses this fork adds for SVRF-native DRC,
+# in-engine ANTENNA, metal fill, CAA, multi-patterning, PERC latch-up, pattern
+# match, LVS recon, CMP gradient and the vendoring sync check were therefore
+# invoked by nothing at all. `vibeic-tests/run_all.sh` invokes every one of them
+# by name and reports PASS / FAIL / named-SKIP; these targets are how a person
+# and CI reach it.
+# ---------------------------------------------------------------------------
+vibeic-test:
+	./vibeic-tests/run_all.sh
+
+vibeic-test-build:
+	./vibeic-tests/build_klayout_noqt.sh
+
+vibeic-test-list:
+	./vibeic-tests/run_all.sh --list
 
 build:
 	@echo "Building for Mac $(GITCOMMIT)"
