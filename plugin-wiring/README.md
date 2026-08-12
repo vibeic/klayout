@@ -81,8 +81,18 @@ all three verdicts plus the honest-skip, so a green run means the checker can st
 
 Both wrappers resolve the engine via, in order:
 1. `$VIBEIC_KLAYOUT_TOOLS/{gds-antenna,metal-fill}/*.py` — set this to where the fork is
-   baked in the `vibeic-eda` container;
+   baked in the `vibeic-eda` container, or to a fork checkout;
 2. a copy shipped next to the wrapper (`programs/gds_antenna/…`, `programs/metal_fill/…`).
+
+**Directory spelling.** This fork names its engine directories with hyphens
+(`gds-antenna/`, `metal-fill/`, and likewise `mp-color/`, `perc-latchup/`,
+`cmp-gradient/` …); the plugin names the same engines with underscores, because its
+program directories sit next to importable Python. `_klayout_launch.find_engine`
+therefore tries BOTH spellings under `$VIBEIC_KLAYOUT_TOOLS` (the caller's first), so
+pointing the variable at a fork checkout resolves — it did not before vibeic/klayout#113
+finding 5, where it matched nothing and fell back to the vendored copy in silence. If the
+override is set and carries no such engine, the miss is now printed on stderr; a silent
+fall-through is what let the mismatch survive.
 
 **Container dependency:** the fork engines under `gds-antenna/` and `metal-fill/` must be
 baked into the `vibeic-eda` image (or shipped as a plugin-local copy per (2)) before the

@@ -1,0 +1,49 @@
+{
+  "_comment": [
+    "Everything this fork adds UNDER src/, and the qmake project that compiles it.",
+    "",
+    "The build that produces the shipped binaries is qmake (build.sh -> tools/klayout/Dockerfile).",
+    "The fork's largest patch by far -- the native SVRF DRC engine, 6,673 lines over 23 commits --",
+    "is compiled only because src/buddies/src/bd/bd.pro names its two .cc files by relative path:",
+    "src/plugins/tools/svrf_drc/svrf_drc.pro is a deliberately EMPTY subdirs project that exists",
+    "only so the src/plugins/tools/tools.pro $$files() auto-glob accepts the folder. That is a",
+    "single, easily-broken line of registration in a file upstream also edits, and if it is lost",
+    "the tree still configures, still builds, and still ships -- with the engine gone.",
+    "",
+    "check_build_registration.py asserts every `path` below exists AND is named by its `built_by`",
+    "project, and -- when the upstream ref is resolvable -- that this manifest still covers every",
+    "source the fork adds under src/. `cpp_tests` is the list run_cpp_unit_tests.sh feeds to",
+    "ut_runner, checked the same way against the TEST()s the fork adds."
+  ],
+  "upstream_ref": "upstream/master",
+  "sources": [
+    {
+      "path": "src/plugins/tools/svrf_drc/db_plugin/dbSVRFEngine.cc",
+      "built_by": "src/buddies/src/bd/bd.pro",
+      "why": "the SVRF/Calibre-syntax DRC engine itself; compiled into klayout_bd for the svrfdrc buddy"
+    },
+    {
+      "path": "src/plugins/tools/svrf_drc/db_plugin/dbSVRFDeck.cc",
+      "built_by": "src/buddies/src/bd/bd.pro",
+      "why": "SVRF rule-deck parser feeding dbSVRFEngine"
+    },
+    {
+      "path": "src/buddies/src/bd/svrfdrc.cc",
+      "built_by": "src/buddies/src/bd/bd.pro",
+      "why": "the `svrfdrc` buddy entry point -- the only shipped artefact that reaches the engine"
+    },
+    {
+      "path": "src/db/unit_tests/dbDeepRegionTests.cc",
+      "built_by": "src/db/unit_tests/unit_tests.pro",
+      "why": "carries the fork's only C++ guard (see cpp_tests); upstream owns the rest of the file"
+    }
+  ],
+  "cpp_tests": [
+    {
+      "group": "dbDeepRegionTests",
+      "test": "deep_two_layer_check_ignores_reduction_split_lines",
+      "guards": "a5a7a2d6b -- DeepShapeStore split lines reported as real polygon edges by two-layer checks",
+      "also_probed_by": "vibeic-tests/deep_split_line_probe.py, which needs no build and so reaches the shipped image"
+    }
+  ]
+}

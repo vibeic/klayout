@@ -2,7 +2,7 @@
 # vibeic-tests -- run the regression harnesses this fork adds.
 #
 # `build.yml` builds Python wheels and executes no test. The repo-root `make test`
-# is macOS-only. So the 25 FAIL->PASS gates this fork carries for SVRF-native DRC,
+# is macOS-only. So the 29 FAIL->PASS gates this fork carries for SVRF-native DRC,
 # in-engine ANTENNA, metal fill, CAA, multi-patterning colouring, PERC latch-up,
 # pattern match, LVS recon, CMP gradient and the plugin-vendoring sync check were
 # reachable from no build system at all.
@@ -10,6 +10,17 @@
 # This workflow invokes `vibeic-tests/run_all.sh`, which invokes each harness BY
 # NAME and reports PASS / FAIL / named-SKIP. It never converts a red suite into a
 # green one: `run_all.sh` exits 1 if any suite fails, and this job fails with it.
+#
+# THIS FILE CANNOT RUN AS THINGS STAND, and saying so here is the point. GitHub
+# Actions is disabled org-wide on the vibeic fork fleet -- measured
+# `gh api repos/vibeic/klayout/actions/permissions` -> {"enabled":false}, and zero
+# workflow runs ever, for any workflow on this fork. It is kept because it is the
+# correct wiring the day Actions is enabled, and because `make vibeic-test` runs
+# exactly what it runs. The mechanism that DOES execute against this repository
+# today is the fleet's fork-gatekeeper: FORKS.json -> post_merge_check, which
+# declares the five suites cheap enough to run in a merge worktree
+# (build-registration, suite-list, vendored-plugin-sync, deep-split-line,
+# shipped-signoff-engines). See the header of vibeic-tests/run_all.sh.
 #
 # Two jobs on purpose:
 #   fast   -- no build, no container. Proves the wiring itself and runs every

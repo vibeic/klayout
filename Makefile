@@ -31,7 +31,7 @@ help:
 #
 # `make test` above is macOS-only (build4mac.py, an .app bundle path, and
 # `ut_runner -h || true`), and `.github/workflows/build.yml` builds wheels and
-# runs no test. The 25 FAIL->PASS harnesses this fork adds for SVRF-native DRC,
+# runs no test. The 29 FAIL->PASS harnesses this fork adds for SVRF-native DRC,
 # in-engine ANTENNA, metal fill, CAA, multi-patterning, PERC latch-up, pattern
 # match, LVS recon, CMP gradient and the vendoring sync check were therefore
 # invoked by nothing at all. `vibeic-tests/run_all.sh` invokes every one of them

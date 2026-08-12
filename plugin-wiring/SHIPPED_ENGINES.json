@@ -1,0 +1,47 @@
+{
+  "_comment": [
+    "The standalone sign-off engines this fork adds, and whether the composed EDA image",
+    "carries them.",
+    "",
+    "They were repo-root Python that NO shipped artefact contained: tools/klayout/Dockerfile's",
+    "publish stage is `FROM scratch` + `COPY --from=build /klayout/bld`, and /klayout/bld is",
+    "build.sh's OUTPUT directory -- build.sh never installs repo-root Python, so all twelve",
+    "entry points were absent from the released image and $VIBEIC_KLAYOUT_TOOLS was unset in it.",
+    "The C++ ports of some of these ops inside dbSVRFEngine DO ship, via the `svrfdrc` buddy;",
+    "what did not ship is the standalone Python.",
+    "",
+    "`install_dir` is what the image stages under $VIBEIC_KLAYOUT_TOOLS. The plugin's",
+    "`_klayout_launch.find_engine` accepts both this hyphenated spelling and its own underscored",
+    "one, so no directory is renamed to make the override resolve.",
+    "",
+    "run_shipped_engines_test.sh asserts every declared directory and entry point exists, and --",
+    "the half that matters -- that no NEW engine directory appears in the tree undeclared. An",
+    "engine added next to its feature and shipped by nothing is the exact defect this file",
+    "closes, so silence is not an option: a new directory must be declared ship=true or ship=false",
+    "WITH a reason."
+  ],
+  "install_root": "/klayout/tools",
+  "engines": [
+    { "dir": "gds-antenna",  "ship": true, "entry": ["antenna_check.py", "xcheck_router.py"],
+      "consumer": "vibe-ic programs/gds_antenna_deck_check.py (flow step 26)" },
+    { "dir": "metal-fill",   "ship": true, "entry": ["metal_fill.py", "metal_cheese.py"],
+      "consumer": "vibe-ic programs/metal_fill_emit.py (flow step 34)" },
+    { "dir": "plugin-wiring", "ship": true, "entry": ["gds_antenna_deck_check.py", "metal_fill_emit.py"],
+      "consumer": "the reference wrappers handed to the plugin; shipped so the image carries the pair the plugin vendors" },
+    { "dir": "caa",          "ship": true, "entry": ["caa.py"],
+      "consumer": "none yet -- critical-area analysis; the in-engine C++ port ships via svrfdrc, this is the standalone entry point" },
+    { "dir": "cmp-gradient", "ship": true, "entry": ["cmp_gradient.py"],
+      "consumer": "none yet -- CMP density-gradient; in-engine C++ port ships via svrfdrc" },
+    { "dir": "lvs-recon",    "ship": true, "entry": ["lvs_recon.py"],
+      "consumer": "none yet -- LVS short isolation" },
+    { "dir": "mp-color",     "ship": true, "entry": ["mp_color.py"],
+      "consumer": "none yet -- multi-patterning colouring; in-engine C++ port ships via svrfdrc" },
+    { "dir": "pattern-match","ship": true, "entry": ["pattern_match.py"],
+      "consumer": "none yet -- DFM pattern match" },
+    { "dir": "perc-latchup", "ship": true, "entry": ["perc_latchup.py"],
+      "consumer": "none yet -- PERC latch-up" }
+  ],
+  "not_engines": [
+    { "dir": "vibeic-tests", "why": "this fork's own regression harnesses and their probes; they run against the image, they are not part of it" }
+  ]
+}

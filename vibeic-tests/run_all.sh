@@ -4,10 +4,12 @@
 #
 # WHY THIS FILE EXISTS
 # --------------------
-# The fork carries 25 hand-written FAIL->PASS gates for the features it adds on
+# The fork carries 29 hand-written FAIL->PASS gates for the features it adds on
 # top of upstream KLayout (SVRF-native DRC, in-engine ANTENNA, metal fill, CAA,
 # multi-patterning colouring, PERC latch-up, pattern match, LVS recon, CMP
-# gradient, and the plugin-vendoring sync check). Every one of them was
+# gradient, the plugin-vendoring sync check, and -- added with vibeic/klayout#113
+# -- build registration, the fork's C++ unit tests, the DeepShapeStore split-line
+# probe and the shipped-engine manifest). Every one of them was
 # unreachable: `.github/workflows/build.yml` builds Python wheels and runs no
 # test at all, and the repo-root `Makefile` has a `test` target that is macOS-only
 # (`build4mac.py`, an .app bundle path, `ut_runner -h || true`). So the suites ran
@@ -15,6 +17,20 @@
 #
 # `make vibeic-test` (repo root) and `.github/workflows/vibeic-tests.yml` both
 # invoke THIS script, and this script invokes every harness by name.
+#
+# AND ONE OF THOSE TWO CANNOT RUN. GitHub Actions is disabled org-wide on the
+# vibeic fork fleet -- measured: `gh api repos/vibeic/klayout/actions/permissions`
+# -> {"enabled":false} and zero workflow runs, ever, for any workflow on this
+# fork -- so a .github/workflows file here is documentation, not a gate. The
+# mechanism that DOES execute against this repository is the fleet's
+# fork-gatekeeper: `FORKS.json` -> `post_merge_check`, run by `daily_merge.py` in
+# the merged worktree before a push and by `check_fork_selftests.py` daily on the
+# clone the image is built from. The five suites cheap enough to run there are
+# declared there (build-registration, suite-list, vendored-plugin-sync,
+# deep-split-line, shipped-signoff-engines). The rest -- anything needing a
+# KLayout build or a long container run -- reach only this script, which is why
+# `make vibeic-test` is the documented way to run them and why the ones that can
+# be made build-free were.
 #
 # WHAT IT DOES NOT DO
 # -------------------
@@ -60,6 +76,10 @@ ROOT="$(cd "$HERE/.." && pwd)"
 # ---------------------------------------------------------------------------
 SUITES=(
   vibeic-tests/check_suite_list.sh
+  vibeic-tests/tests/run_build_registration_test.sh
+  vibeic-tests/tests/run_cpp_unit_tests.sh
+  vibeic-tests/tests/run_deep_split_line_test.sh
+  vibeic-tests/tests/run_shipped_engines_test.sh
   caa/tests/run_caa_test.sh
   cmp-gradient/tests/run_cmp_gradient_test.sh
   gds-antenna/tests/run_antenna_tests.sh
@@ -189,10 +209,22 @@ for s in "${SUITES[@]}"; do
   fi
 
   # --- prerequisites, checked BEFORE the run so the reason is precise -------
+  #
+  # The greps below INFER what a harness needs from what it mentions, which is
+  # right for the 25 harnesses that need exactly one thing and wrong for one
+  # that can satisfy itself several ways: a harness able to run against a local
+  # build OR an ambient binding OR the container mentions all three, and the
+  # inference then skips it for the absence of the first. A harness that
+  # resolves its own prerequisites and prints its own named SKIP says so with
+  # the line `# vibeic-prereq: self` and is simply run.
   need_docker=0; need_klbin=0; need_db=0
-  grep -q 'docker run' "$path" && need_docker=1
-  grep -qE 'command -v (strmrun|klayout|svrfdrc)' "$path" && need_klbin=1
-  grep -q 'KLAYOUT_BLD' "$path" && need_db=1
+  if grep -q '^# vibeic-prereq: self' "$path"; then
+    :
+  else
+    grep -q 'docker run' "$path" && need_docker=1
+    grep -qE 'command -v (strmrun|klayout|svrfdrc)' "$path" && need_klbin=1
+    grep -q 'KLAYOUT_BLD' "$path" && need_db=1
+  fi
 
   why=""
   [ $need_db = 1 ]     && [ $HAVE_DBBUILD = 0 ] && why="$DB_WHY"
