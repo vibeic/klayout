@@ -888,10 +888,10 @@ std::map<unsigned int, db::Coord>
 check_local_operation<TS, TI>::override_distance () const
 {
   //  makes sure, the "foreign"-type pseudo-intruder used for merging only
-  //  does not use the full search range, but only "touching".
+  //  does not use the full search range, but only "touching" (distance 1).
   //  NOTE: in box_scanner terms an enlargement of 1 - not 0 - is "touching"
   //  (see dbBoxScanner.h: "An enlargement of 1 means that boxes have to touch
-  //  only in order to get an interaction"). With 0 the boxes had to overlap,
+  //  in order to get an interaction"). With 0 the boxes had to overlap,
   //  so two fragments of a single polygon split by the DeepShapeStore's
   //  complexity reduction (max_vertex_count/max_area_ratio) - which share
   //  exactly an edge and whose boxes therefore only touch - were never seen
