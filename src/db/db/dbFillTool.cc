@@ -308,9 +308,13 @@ create_instances (GenericRasterizer &am, db::Cell *cell, db::cell_index_type fil
   return ninsts;
 }
 
+//  @param placed_exclude If non-null, fill cells already placed for other polygons of the same fill
+//                        region, enlarged by the fill margin. Fill cells must not be placed there.
+//  @param placed_out If non-null, receives the fill boxes placed here, enlarged by the fill margin.
 static bool
 fill_polygon_impl (db::Cell *cell, const db::Polygon &fp0, db::cell_index_type fill_cell_index, const db::Box &fc_bbox, const db::Vector &row_step, const db::Vector &column_step, const db::Point &origin, bool enhanced_fill,
-                   std::vector <db::Polygon> *remaining_parts, const db::Vector &fill_margin, const db::Box &glue_box, const db::Region &exclude_area)
+                   std::vector <db::Polygon> *remaining_parts, const db::Vector &fill_margin, const db::Box &glue_box, const db::Region &exclude_area,
+                   const db::Region *placed_exclude = 0, std::vector <db::Polygon> *placed_out = 0)
 {
   if (row_step.x () <= 0 || column_step.y () <= 0) {
     throw tl::Exception (tl::to_string (tr ("Invalid row or column step vectors in fill_region: row step must have a positive x component while column step must have a positive y component")));
@@ -377,6 +381,23 @@ fill_polygon_impl (db::Cell *cell, const db::Polygon &fp0, db::cell_index_type f
 
   }
 
+  //  Take out the fill cells already placed for other polygons of this fill region, enlarged by the
+  //  fill margin. In enhanced mode every polygon anchors its own raster, so neighbouring polygons
+  //  produce arrays with different origins and the fill margin is the only thing that can hold them
+  //  apart. This happens BEFORE "filled_poly_uncleaned" is taken so the separation also propagates
+  //  into the remaining parts and a later iteration cannot fill the strip either.
+  if (placed_exclude && ! placed_exclude->empty ()) {
+
+    auto it = placed_exclude->begin_iter ();
+    it.first.confine_region (fp0.box ());
+
+    db::Region placed (it.first, it.second);
+    if (! placed.empty ()) {
+      fr -= placed;
+    }
+
+  }
+
   std::vector <db::Polygon> filled_poly, filled_poly_uncleaned;
 
   //  save the uncleaned polygons, so we subtract the filled parts to
@@ -419,7 +440,7 @@ fill_polygon_impl (db::Cell *cell, const db::Polygon &fp0, db::cell_index_type f
     tl_assert (remaining_parts == 0);
     GenericRasterizer am (filled_poly, rasterized_area, row_step, column_step, origin, fc_bbox.p2 () - fc_bbox.p1 ());
 
-    size_t ninsts = create_instances (am, cell, fill_cell_index, kernel_origin, fill_margin, exclude_rasterized.get (), 0);
+    size_t ninsts = create_instances (am, cell, fill_cell_index, kernel_origin, fill_margin, exclude_rasterized.get (), placed_out ? &filled_regions : 0);
     if (ninsts > 0) {
       any_fill = true;
     }
@@ -452,7 +473,7 @@ fill_polygon_impl (db::Cell *cell, const db::Polygon &fp0, db::cell_index_type f
 
       GenericRasterizer am (*fp, rasterized_area, row_step, column_step, o, fc_bbox.p2 () - fc_bbox.p1 ());
 
-      size_t ninsts = create_instances (am, cell, fill_cell_index, kernel_origin, fill_margin, 0, remaining_parts ? &filled_regions : 0);
+      size_t ninsts = create_instances (am, cell, fill_cell_index, kernel_origin, fill_margin, 0, (remaining_parts || placed_out) ? &filled_regions : 0);
       if (ninsts > 0) {
         any_fill = true;
       }
@@ -464,6 +485,10 @@ fill_polygon_impl (db::Cell *cell, const db::Polygon &fp0, db::cell_index_type f
 
     }
 
+  }
+
+  if (placed_out) {
+    placed_out->insert (placed_out->end (), filled_regions.begin (), filled_regions.end ());
   }
 
   if (any_fill || has_exclude_area) {
@@ -512,6 +537,14 @@ fill_region_impl (db::Cell *cell, const db::Region &fr, db::cell_index_type fill
 
   std::vector<db::Polygon> rem_pp, rem_poly;
 
+  //  Fill cells placed so far in this pass, enlarged by the fill margin - see fill_polygon_impl.
+  //  Only enhanced mode needs this: with a global origin every polygon uses the same raster, so the
+  //  arrays are pitch-compatible by construction and no safety distance applies. A zero margin asks
+  //  for no separation, and the polygons of a merged region are disjoint anyway, so skip that too.
+  const bool track_placed = enhanced_fill && fill_margin != db::Vector ();
+  db::Region placed_with_margin;
+  std::vector<db::Polygon> placed_here;
+
   size_t n = 0;
   for (db::Region::const_iterator p = fr.begin_merged (); !p.at_end (); ++p) {
     ++n;
@@ -527,10 +560,15 @@ fill_region_impl (db::Cell *cell, const db::Region &fr, db::cell_index_type fill
     tl::RelativeProgress progress (progress_title, n);
 
     for (db::Region::const_iterator p = fr.begin_merged (); !p.at_end (); ++p) {
-      if (! fill_polygon_impl (cell, *p, fill_cell_index, fc_bbox, row_step, column_step, origin, enhanced_fill, remaining_parts ? &rem_pp : 0, fill_margin, glue_box, exclude_area)) {
+      placed_here.clear ();
+      if (! fill_polygon_impl (cell, *p, fill_cell_index, fc_bbox, row_step, column_step, origin, enhanced_fill, remaining_parts ? &rem_pp : 0, fill_margin, glue_box, exclude_area,
+                               track_placed ? &placed_with_margin : 0, track_placed ? &placed_here : 0)) {
         if (remaining_polygons) {
           rem_poly.push_back (*p);
         }
+      }
+      for (std::vector<db::Polygon>::const_iterator i = placed_here.begin (); i != placed_here.end (); ++i) {
+        placed_with_margin.insert (*i);
       }
       ++progress;
     }

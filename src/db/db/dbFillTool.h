@@ -99,6 +99,11 @@ fill_region (db::Cell *cell, const db::Polygon &fp, db::cell_index_type fill_cel
  *  fill_margin will specify the margin around the filled area when computing (through subtraction of the tiled area) the remaining_parts.
  *  remaining_polygons (if non-null) will receive the polygons which could not be filled at all.
  *
+ *  In enhanced fill mode every polygon of the region is filled with its own, locally optimized raster origin, so
+ *  two neighboring polygons produce two pitch-incompatible arrays. fill_margin therefore also acts BETWEEN the
+ *  polygons: a fill cell is not placed within fill_margin of a fill cell already placed for another polygon of the
+ *  same region. This applies whether or not remaining_parts is requested.
+ *
  *  In enhanced fill mode, the origin is ignored unless a glue box is given.
  */
 
